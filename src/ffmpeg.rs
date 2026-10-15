@@ -577,35 +577,92 @@ fn encode_segment(
     progress: (f32, f32),
 ) -> Result<(), ExportError> {
     let progress_path = dest.with_extension("progress");
-    let args = match mode {
-        EncodeMode::FastCopy => fast_copy_args(segment, dest, &progress_path),
-        EncodeMode::Compatible => {
-            let crf = settings.video_crf.clamp(0, 51);
-            let audio_bitrate = normalize_bitrate(&settings.audio_bitrate)
-                .map_err(|err| ExportError::Message(format!("Audio bitrate: {err}")))?;
-            let target = target.unwrap_or_else(|| output_target(segment));
-            compatible_args(
-                segment,
-                dest,
-                &target,
-                &progress_path,
-                crf,
-                &audio_bitrate,
-                settings.hw,
-            )
-        }
-    };
+    let gpu = mode == EncodeMode::Compatible && settings.hw == HwAccel::Intel && cfg!(windows);
+    let args = encode_args(
+        segment,
+        dest,
+        mode,
+        target.as_ref(),
+        settings,
+        &progress_path,
+        gpu,
+    )?;
     let duration = (segment.end - segment.start).max(0.05);
-    run_with_progress(
+    match run_with_progress(
         &args,
         &progress_path,
         duration,
         hooks,
         progress.0,
         progress.1,
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(ExportError::Cancelled) => return Err(ExportError::Cancelled),
+        Err(_) if gpu => {
+            check_cancel(hooks)?;
+            (hooks.log)(
+                "Quick Sync could not keep frames on the GPU. Using the slower encoder.".into(),
+            );
+            let _ = std::fs::remove_file(dest);
+            let slow = encode_args(
+                segment,
+                dest,
+                mode,
+                target.as_ref(),
+                settings,
+                &progress_path,
+                false,
+            )?;
+            run_with_progress(
+                &slow,
+                &progress_path,
+                duration,
+                hooks,
+                progress.0,
+                progress.1,
+            )?;
+        }
+        Err(err) => return Err(err),
+    }
     let _ = std::fs::remove_file(&progress_path);
     Ok(())
+}
+
+fn encode_args(
+    segment: &Segment,
+    dest: &Path,
+    mode: EncodeMode,
+    target: Option<&Target>,
+    settings: &EncodeSettings,
+    progress_path: &Path,
+    gpu: bool,
+) -> Result<Vec<String>, ExportError> {
+    Ok(match mode {
+        EncodeMode::FastCopy => fast_copy_args(segment, dest, progress_path),
+        EncodeMode::Compatible => {
+            let crf = settings.video_crf.clamp(0, 51);
+            let audio_bitrate = normalize_bitrate(&settings.audio_bitrate)
+                .map_err(|err| ExportError::Message(format!("Audio bitrate: {err}")))?;
+            let owned;
+            let target = match target {
+                Some(target) => target,
+                None => {
+                    owned = output_target(segment);
+                    &owned
+                }
+            };
+            compatible_args(
+                segment,
+                dest,
+                target,
+                progress_path,
+                crf,
+                &audio_bitrate,
+                settings.hw,
+                gpu,
+            )
+        }
+    })
 }
 
 fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String> {
@@ -637,6 +694,7 @@ fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compatible_args(
     segment: &Segment,
     dest: &Path,
@@ -645,6 +703,7 @@ fn compatible_args(
     video_crf: i32,
     audio_bitrate: &str,
     hw: HwAccel,
+    gpu: bool,
 ) -> Vec<String> {
     let duration = segment.end - segment.start;
     let mut args = vec![
@@ -656,9 +715,14 @@ fn compatible_args(
         "-loglevel".into(),
         "error".into(),
     ];
-    // Hardware decode of the source. Frames are still filtered on the CPU,
-    // then handed to the hardware encoder below.
-    args.extend(export_input_args(hw));
+    // `gpu` keeps Windows Intel frames on the encode engine. The other path
+    // copies every frame back to memory, which only keeps the decode unit busy.
+    let gpu = gpu && hw == HwAccel::Intel && cfg!(windows);
+    if gpu {
+        args.extend(intel_gpu_input_args());
+    } else {
+        args.extend(export_input_args(hw));
+    }
     args.extend([
         // `-ss` before `-i` is fast. Re-encoding still starts near the requested frame,
         // because ffmpeg decodes back to the previous keyframe.
@@ -690,11 +754,20 @@ fn compatible_args(
 
     // Leave size, frame rate, and pixel format alone when they already match.
     // A scale or fps filter resamples the picture even if the numbers look the same.
-    if let Some(filter) = video_filter(segment, target, hw) {
+    let filter = if gpu {
+        Some(intel_gpu_filter(segment, target))
+    } else {
+        video_filter(segment, target, hw)
+    };
+    if let Some(filter) = filter {
         args.extend(["-vf".into(), filter]);
     }
 
-    args.extend(video_encoder_args(segment, video_crf, hw));
+    if gpu {
+        args.extend(intel_fast_encoder_args(segment, video_crf));
+    } else {
+        args.extend(video_encoder_args(segment, video_crf, hw));
+    }
     args.extend([
         "-c:a".into(),
         "aac".into(),
@@ -713,6 +786,61 @@ fn compatible_args(
         "+faststart".into(),
         dest.display().to_string(),
     ]);
+    args
+}
+
+/// D3D11 surfaces mapped into Quick Sync. One decoder thread, or the fixed
+/// surface pool overflows (`Static surface pool size exceeded`).
+fn intel_gpu_input_args() -> Vec<String> {
+    vec![
+        "-init_hw_device".into(),
+        "d3d11va=intel,vendor=0x8086".into(),
+        "-hwaccel".into(),
+        "d3d11va".into(),
+        "-hwaccel_device".into(),
+        "intel".into(),
+        "-hwaccel_output_format".into(),
+        "d3d11".into(),
+        "-threads".into(),
+        "1".into(),
+        "-extra_hw_frames".into(),
+        "128".into(),
+    ]
+}
+
+fn intel_gpu_filter(segment: &Segment, target: &Target) -> String {
+    let mut chain = String::from("hwmap=derive_device=qsv,format=qsv");
+    let size_differs = segment.width != target.width || segment.height != target.height;
+    let fps_differs = (segment.fps - target.fps).abs() > 0.01;
+    if size_differs || fps_differs {
+        let mut vpp = format!("vpp_qsv=w={}:h={}", target.width, target.height);
+        if fps_differs {
+            vpp.push_str(&format!(":framerate={}", format_fps(target.fps)));
+        }
+        chain.push(',');
+        chain.push_str(&vpp);
+    }
+    chain
+}
+
+fn intel_fast_encoder_args(segment: &Segment, crf: i32) -> Vec<String> {
+    let quality = crf.clamp(0, 51).to_string();
+    let mut args = vec![
+        "-c:v".into(),
+        "h264_qsv".into(),
+        // veryfast + low_power is Intel's VDENC path, the one HandBrake uses.
+        "-preset".into(),
+        "veryfast".into(),
+        "-low_power".into(),
+        "1".into(),
+        "-async_depth".into(),
+        "4".into(),
+        "-look_ahead".into(),
+        "0".into(),
+        "-global_quality".into(),
+        quality,
+    ];
+    args.extend(color_args(segment));
     args
 }
 
@@ -1069,18 +1197,42 @@ fn intel_windows_encoder_accepts(dest: &Path) -> bool {
     }
     let segment = probe_segment();
     let target = output_target(&segment);
-    let mut cmd = Command::new(ffmpeg_program());
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-    cmd.args(export_input_args(HwAccel::Intel));
-    cmd.arg("-i").arg(&tiny);
-    if let Some(filter) = video_filter(&segment, &target, HwAccel::Intel) {
-        cmd.args(["-vf", &filter]);
-    }
-    cmd.args(video_encoder_args(&segment, 23, HwAccel::Intel));
-    cmd.arg(dest);
-    let ok = command_ok(cmd, Duration::from_secs(5)) && dest.is_file();
+    let fast = intel_probe_encode(&tiny, dest, &segment, &target, true);
+    let ok = fast || intel_probe_encode(&tiny, dest, &segment, &target, false);
     let _ = std::fs::remove_file(tiny);
     ok
+}
+
+fn intel_probe_encode(
+    src: &Path,
+    dest: &Path,
+    segment: &Segment,
+    target: &Target,
+    gpu: bool,
+) -> bool {
+    let mut cmd = Command::new(ffmpeg_program());
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    if gpu {
+        cmd.args(intel_gpu_input_args());
+    } else {
+        cmd.args(export_input_args(HwAccel::Intel));
+    }
+    cmd.arg("-i").arg(src);
+    let filter = if gpu {
+        Some(intel_gpu_filter(segment, target))
+    } else {
+        video_filter(segment, target, HwAccel::Intel)
+    };
+    if let Some(filter) = filter {
+        cmd.args(["-vf", &filter]);
+    }
+    if gpu {
+        cmd.args(intel_fast_encoder_args(segment, 23));
+    } else {
+        cmd.args(video_encoder_args(segment, 23, HwAccel::Intel));
+    }
+    cmd.arg(dest);
+    command_ok(cmd, Duration::from_secs(8)) && dest.is_file()
 }
 
 fn decoder_accepts(hw: HwAccel, src: &Path) -> bool {
@@ -1813,6 +1965,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             18,
             "192k",
             HwAccel::Off,
+            false,
         );
         assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-b:v"));
         assert!(args.windows(2).any(|pair| pair == ["-crf", "18"]));
