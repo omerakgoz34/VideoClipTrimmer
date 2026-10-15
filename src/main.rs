@@ -10,6 +10,9 @@ mod ui;
 
 use miniquad as mq;
 
+/// From the `version` field in Cargo.toml, set when the app is built.
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 fn main() {
     // Sleep until the next click, unless playback or an export asks for another frame.
     let platform = mq::conf::Platform {
@@ -19,7 +22,7 @@ fn main() {
     };
 
     let conf = mq::conf::Conf {
-        window_title: format!("VideoClipTrimmer {}", env!("CARGO_PKG_VERSION")),
+        window_title: format!("VideoClipTrimmer {VERSION}"),
         window_width: 1280,
         window_height: 720,
         high_dpi: true,
