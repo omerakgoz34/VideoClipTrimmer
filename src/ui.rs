@@ -224,23 +224,25 @@ impl App {
         }
         self.themed = true;
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.interact_size.y = 26.0;
+        style.spacing.icon_width = 18.0;
         style.text_styles.insert(
             egui::TextStyle::Body,
-            egui::FontId::new(14.5, egui::FontFamily::Proportional),
+            egui::FontId::new(16.0, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Button,
-            egui::FontId::new(14.5, egui::FontFamily::Proportional),
+            egui::FontId::new(16.0, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Small,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            egui::FontId::new(13.5, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Heading,
-            egui::FontId::new(20.0, egui::FontFamily::Proportional),
+            egui::FontId::new(22.0, egui::FontFamily::Proportional),
         );
         ctx.set_style(style);
 
@@ -388,7 +390,7 @@ impl App {
             ui.label("In");
             let in_edit = ui.add_enabled(
                 has_media,
-                egui::TextEdit::singleline(&mut self.in_text).desired_width(96.0),
+                egui::TextEdit::singleline(&mut self.in_text).desired_width(112.0),
             );
             if in_edit.changed() {
                 if let Some(time) = parse_time(&self.in_text) {
@@ -410,7 +412,7 @@ impl App {
             ui.label("Out");
             let out_edit = ui.add_enabled(
                 has_media,
-                egui::TextEdit::singleline(&mut self.out_text).desired_width(96.0),
+                egui::TextEdit::singleline(&mut self.out_text).desired_width(112.0),
             );
             if out_edit.changed() {
                 if let Some(time) = parse_time(&self.out_text) {
@@ -461,7 +463,7 @@ impl App {
         if self.mode == EncodeMode::Compatible {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Video quality");
-                ui.spacing_mut().slider_width = 150.0;
+                ui.spacing_mut().slider_width = 190.0;
                 ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
                 ui.label(muted("lower keeps more detail"));
             });
@@ -579,7 +581,7 @@ impl App {
                     format_time(clip.end - clip.start)
                 );
                 let mut button = egui::Button::new(format!("{title}\n{meta}"))
-                    .min_size(egui::vec2(ui.available_width(), 44.0));
+                    .min_size(egui::vec2(ui.available_width(), 52.0));
                 if selected {
                     button = button.fill(rgb(0x3d, 0x6a, 0x74));
                 }
@@ -1240,7 +1242,7 @@ fn timeline(
 ) -> Option<f64> {
     let width = ui.available_width();
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click_and_drag());
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, rgb(0x10, 0x11, 0x14));
     if duration > 0.0 {
@@ -1253,7 +1255,7 @@ fn timeline(
         painter.rect_filled(range, 4.0, rgb(0x3d, 0x6a, 0x74));
         let head = egui::Rect::from_center_size(
             egui::pos2(x_at(playhead), rect.center().y),
-            egui::vec2(2.0, rect.height()),
+            egui::vec2(3.0, rect.height()),
         );
         painter.rect_filled(head, 0.0, rgb(0xec, 0xea, 0xe4));
     }
@@ -1330,8 +1332,8 @@ impl egui::Widget for IconButton<'_> {
         let galley =
             ui.painter()
                 .layout_no_wrap(self.label.to_owned(), font, egui::Color32::PLACEHOLDER);
-        let icon = 12.0;
-        let gap = 6.0;
+        let icon = (galley.size().y + 6.0).max(20.0);
+        let gap = 8.0;
         let pad = ui.spacing().button_padding;
         let height = galley.size().y.max(icon);
         let size = egui::vec2(
@@ -1373,25 +1375,25 @@ impl egui::Widget for IconButton<'_> {
 }
 
 fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.6_f32, color);
+    let stroke = egui::Stroke::new(2.2_f32, color);
     let c = rect.center();
     let s = rect.width().min(rect.height());
     match icon {
         Icon::Play => {
             painter.add(egui::Shape::convex_polygon(
                 vec![
-                    egui::pos2(c.x - s * 0.28, c.y - s * 0.38),
-                    egui::pos2(c.x - s * 0.28, c.y + s * 0.38),
-                    egui::pos2(c.x + s * 0.38, c.y),
+                    egui::pos2(c.x - s * 0.34, c.y - s * 0.46),
+                    egui::pos2(c.x - s * 0.34, c.y + s * 0.46),
+                    egui::pos2(c.x + s * 0.46, c.y),
                 ],
                 color,
                 egui::Stroke::NONE,
             ));
         }
         Icon::Pause => {
-            let h = s * 0.38;
-            let w = s * 0.16;
-            for dx in [-s * 0.22, s * 0.06] {
+            let h = s * 0.46;
+            let w = s * 0.22;
+            for dx in [-s * 0.28, s * 0.06] {
                 painter.rect_filled(
                     egui::Rect::from_min_size(
                         egui::pos2(c.x + dx, c.y - h),
@@ -1404,27 +1406,27 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui
         }
         Icon::Back => painter.arrow(
             c + egui::vec2(s * 0.2, 0.0),
-            egui::vec2(-s * 0.55, 0.0),
+            egui::vec2(-s * 0.68, 0.0),
             stroke,
         ),
         Icon::Forward => painter.arrow(
             c - egui::vec2(s * 0.2, 0.0),
-            egui::vec2(s * 0.55, 0.0),
+            egui::vec2(s * 0.68, 0.0),
             stroke,
         ),
         Icon::Go => painter.arrow(
             c - egui::vec2(s * 0.28, 0.0),
-            egui::vec2(s * 0.55, 0.0),
+            egui::vec2(s * 0.68, 0.0),
             stroke,
         ),
         Icon::Up => painter.arrow(
             c + egui::vec2(0.0, s * 0.15),
-            egui::vec2(0.0, -s * 0.5),
+            egui::vec2(0.0, -s * 0.62),
             stroke,
         ),
         Icon::Down => painter.arrow(
             c - egui::vec2(0.0, s * 0.15),
-            egui::vec2(0.0, s * 0.5),
+            egui::vec2(0.0, s * 0.62),
             stroke,
         ),
         Icon::Mark => {
@@ -1447,16 +1449,16 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui
         }
         Icon::Plus => {
             painter.line_segment(
-                [c - egui::vec2(s * 0.32, 0.0), c + egui::vec2(s * 0.32, 0.0)],
+                [c - egui::vec2(s * 0.4, 0.0), c + egui::vec2(s * 0.4, 0.0)],
                 stroke,
             );
             painter.line_segment(
-                [c - egui::vec2(0.0, s * 0.32), c + egui::vec2(0.0, s * 0.32)],
+                [c - egui::vec2(0.0, s * 0.4), c + egui::vec2(0.0, s * 0.4)],
                 stroke,
             );
         }
         Icon::Update => {
-            painter.circle_stroke(c, s * 0.28, stroke);
+            painter.circle_stroke(c, s * 0.36, stroke);
             painter.arrow(
                 egui::pos2(c.x + s * 0.02, c.y - s * 0.28),
                 egui::vec2(s * 0.28, 0.05),
@@ -1478,7 +1480,7 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui
             );
         }
         Icon::Remove => {
-            let d = s * 0.28;
+            let d = s * 0.36;
             painter.line_segment([c - egui::vec2(d, d), c + egui::vec2(d, d)], stroke);
             painter.line_segment([c - egui::vec2(d, -d), c + egui::vec2(d, -d)], stroke);
         }
@@ -1528,7 +1530,7 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui
 fn muted(text: &str) -> egui::RichText {
     egui::RichText::new(text)
         .color(rgb(0x9c, 0x98, 0x90))
-        .size(12.5)
+        .size(13.5)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
