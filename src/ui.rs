@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::ffmpeg::{
-    self, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab, spawn_hw_detect, EncodeMode,
-    EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, Segment,
+    self, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab, spawn_hw_detect, spawn_play,
+    EncodeMode, EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, PlayEvent,
+    PlayRequest, PlaySession, Segment,
 };
 use crate::timeutil::{format_time, parse_time};
 
@@ -30,7 +31,6 @@ pub struct App {
     out_edit: bool,
     playing: bool,
     loop_range: bool,
-    last_tick: Instant,
     clips: Vec<Clip>,
     selected: Option<usize>,
     mode: EncodeMode,
@@ -50,6 +50,7 @@ pub struct App {
     wanted_time: Option<f64>,
     grab: Option<Receiver<Grabbed>>,
     grab_seq: u64,
+    play: Option<PlaySession>,
     job: Option<Job>,
     themed: bool,
 }
@@ -110,10 +111,9 @@ impl App {
             out_edit: false,
             playing: false,
             loop_range: false,
-            last_tick: Instant::now(),
             clips: Vec::new(),
             selected: None,
-            mode: EncodeMode::Compatible,
+            mode: EncodeMode::FastCopy,
             video_crf: 18,
             audio_bitrate: "192k".to_string(),
             audio_bitrate_edited: false,
@@ -130,6 +130,7 @@ impl App {
             wanted_time: None,
             grab: None,
             grab_seq: 0,
+            play: None,
             job: None,
             themed: false,
         }
@@ -137,10 +138,20 @@ impl App {
 
     pub fn wants_redraw(&self) -> bool {
         self.playing
+            || self.play.is_some()
             || self.grab.is_some()
             || self.job.is_some()
             || self.wanted_time.is_some()
             || self.hw_detect.is_some()
+    }
+
+    /// Keeps the window from spinning at full speed while a frame is on the way.
+    pub fn redraw_wait(&self) -> Duration {
+        if self.playing || self.grab.is_some() || self.job.is_some() || self.hw_detect.is_some() {
+            Duration::from_millis(12)
+        } else {
+            Duration::ZERO
+        }
     }
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>) {
@@ -178,7 +189,6 @@ impl App {
 
     pub fn ui(&mut self, ctx: &egui::Context) {
         self.ensure_theme(ctx);
-        self.tick();
         self.poll_hw_detect();
         self.pump_preview(ctx);
         self.poll_job();
@@ -442,7 +452,7 @@ impl App {
             {
                 self.export_current();
             }
-            ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Compatible");
+            ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Re-Encode");
             ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast copy");
         });
         if self.mode == EncodeMode::Compatible {
@@ -475,6 +485,7 @@ impl App {
             if self.hw != previous {
                 self.hw_warned = false;
                 self.hw_touched = true;
+                self.play = None;
                 save_hw(self.hw);
                 if self.media.is_some() {
                     self.wanted_time = Some(self.playhead);
@@ -680,30 +691,13 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
-        self.last_tick = now;
-        if !self.playing {
-            return;
-        }
-        let Some(end) = self.media.as_ref().map(|_| self.out_point) else {
-            self.playing = false;
-            return;
-        };
-        self.playhead += dt;
-        if self.playhead >= end {
-            if self.loop_range {
-                self.playhead = self.in_point;
-            } else {
-                self.playhead = end;
-                self.playing = false;
-            }
-        }
-        self.wanted_time = Some(self.playhead);
-    }
-
     fn pump_preview(&mut self, ctx: &egui::Context) {
+        if self.playing {
+            self.pump_play(ctx);
+            return;
+        }
+        self.play = None;
+
         let finished = self.grab.as_ref().and_then(|rx| rx.try_recv().ok());
         if finished.is_some() {
             self.grab = None;
@@ -718,26 +712,12 @@ impl App {
             if seq == self.grab_seq {
                 match result {
                     Ok(frame) => {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            &frame.pixels,
-                        );
-                        let options = egui::TextureOptions::LINEAR;
-                        if let Some(tex) = &mut self.preview {
-                            tex.set(image, options);
-                        } else {
-                            self.preview = Some(ctx.load_texture("preview", image, options));
-                        }
-                        self.shown_time = Some(time);
-                        if let Some(warning) = warning {
-                            if !self.hw_warned {
-                                self.hw_warned = true;
-                                self.info(warning.lines().next().unwrap_or(&warning).to_string());
-                                self.push_log(warning);
-                            }
-                        }
+                        self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time)
                     }
                     Err(err) => self.fail(format!("Preview: {err}")),
+                }
+                if let Some(warning) = warning {
+                    self.note_hw_fallback(&warning);
                 }
             }
         }
@@ -748,10 +728,9 @@ impl App {
         if self.grab.is_some() {
             return;
         }
-        let close_enough = if self.playing { 0.12 } else { 0.04 };
         if self
             .shown_time
-            .is_some_and(|shown| (shown - wanted).abs() < close_enough)
+            .is_some_and(|shown| (shown - wanted).abs() < 0.04)
         {
             self.wanted_time = None;
             return;
@@ -768,6 +747,105 @@ impl App {
         self.grab_seq += 1;
         self.grab = Some(spawn_grab(path, time, self.grab_seq, self.hw));
         self.wanted_time = None;
+    }
+
+    fn pump_play(&mut self, ctx: &egui::Context) {
+        let Some(media) = self.media.as_ref() else {
+            self.playing = false;
+            self.play = None;
+            return;
+        };
+        let path = media.path.clone();
+        let fps = media.info.fps;
+        let width = media.info.width;
+        let height = media.info.height;
+        let hw = self.hw;
+        let restart = self
+            .play
+            .as_ref()
+            .map(|play| play.path != path || play.hw != hw)
+            .unwrap_or(true);
+        if restart {
+            self.play = Some(spawn_play(PlayRequest {
+                path,
+                start: self.playhead,
+                fps,
+                width,
+                height,
+                hw,
+            }));
+        }
+        let Some(play) = &self.play else {
+            return;
+        };
+        let mut latest = None;
+        while let Ok(event) = play.try_recv() {
+            latest = Some(event);
+        }
+        let Some(event) = latest else {
+            return;
+        };
+        match event {
+            PlayEvent::Warning(text) => self.note_hw_fallback(&text),
+            PlayEvent::Frame { time, frame } => {
+                if time >= self.out_point - 0.02 {
+                    self.play = None;
+                    if self.loop_range {
+                        self.playhead = self.in_point;
+                        self.shown_time = None;
+                    } else {
+                        self.playhead = self.out_point.min(self.duration());
+                        self.playing = false;
+                    }
+                    return;
+                }
+                self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
+                self.playhead = time;
+            }
+            PlayEvent::Ended => {
+                self.play = None;
+                if self.loop_range {
+                    self.playhead = self.in_point;
+                    self.shown_time = None;
+                } else {
+                    self.playing = false;
+                }
+            }
+            PlayEvent::Failed(err) => {
+                self.play = None;
+                self.playing = false;
+                self.fail(format!("Preview: {err}"));
+            }
+        }
+    }
+
+    fn present_frame(
+        &mut self,
+        ctx: &egui::Context,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        time: f64,
+    ) {
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels);
+        let options = egui::TextureOptions::LINEAR;
+        if let Some(tex) = &mut self.preview {
+            tex.set(image, options);
+        } else {
+            self.preview = Some(ctx.load_texture("preview", image, options));
+        }
+        self.shown_time = Some(time);
+    }
+
+    fn note_hw_fallback(&mut self, warning: &str) {
+        if self.hw_warned {
+            return;
+        }
+        self.hw_warned = true;
+        let line = warning.lines().next().unwrap_or(warning).to_string();
+        self.info(line);
+        self.push_log(warning.to_string());
     }
 
     fn poll_job(&mut self) {
@@ -1015,8 +1093,8 @@ impl App {
             self.playhead = self.in_point;
         }
         self.playing = true;
-        self.last_tick = Instant::now();
-        self.wanted_time = Some(self.playhead);
+        self.wanted_time = None;
+        self.play = None;
     }
 
     fn nudge(&mut self, delta: f64) {

@@ -81,6 +81,10 @@ impl mq::EventHandler for Stage {
         mq_ctx.commit_frame();
 
         if app.wants_redraw() {
+            let wait = app.redraw_wait();
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
             mq::window::schedule_update();
         }
     }

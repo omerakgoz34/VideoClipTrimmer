@@ -5,9 +5,9 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -219,20 +219,23 @@ pub fn grab_frame(path: &Path, time: f64, hw: HwAccel) -> Result<GrabOutcome, St
 fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, String> {
     let mut command = Command::new(ffmpeg_program());
     command
-        .args(["-hide_banner", "-loglevel", "error"])
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(hw_decode_args(hw))
         .args(["-ss", &format!("{time:.3}"), "-i"])
         .arg(path)
         .args([
+            "-map",
+            "0:v:0",
+            "-an",
             "-frames:v",
             "1",
             // Fit inside a 960 box. Preview only — the export keeps full resolution.
             "-vf",
-            "scale=960:960:force_original_aspect_ratio=decrease",
+            "scale=960:960:force_original_aspect_ratio=decrease:flags=fast_bilinear",
             "-c:v",
             "mjpeg",
             "-q:v",
-            "4",
+            "5",
             "-f",
             "image2pipe",
             "pipe:1",
@@ -256,6 +259,228 @@ fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, Str
         height: rgba.height(),
         pixels: rgba.into_raw(),
     })
+}
+
+/// One open ffmpeg process that decodes forward. Playback reads this instead of
+/// starting a new ffmpeg for every frame.
+pub struct PlaySession {
+    pub path: PathBuf,
+    pub hw: HwAccel,
+    rx: mpsc::Receiver<PlayEvent>,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+pub enum PlayEvent {
+    Warning(String),
+    Frame { time: f64, frame: RgbaFrame },
+    Ended,
+    Failed(String),
+}
+
+pub struct PlayRequest {
+    pub path: PathBuf,
+    pub start: f64,
+    pub fps: f64,
+    pub width: u32,
+    pub height: u32,
+    pub hw: HwAccel,
+}
+
+impl PlaySession {
+    pub fn try_recv(&self) -> Result<PlayEvent, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for PlaySession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(child) = slot.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+pub fn spawn_play(request: PlayRequest) -> PlaySession {
+    let stop = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(None));
+    let (tx, rx) = mpsc::sync_channel(2);
+    let stop_worker = Arc::clone(&stop);
+    let child_worker = Arc::clone(&child);
+    let path = request.path.clone();
+    let hw = request.hw;
+    thread::spawn(move || play_worker(request, stop_worker, child_worker, tx));
+    PlaySession {
+        path,
+        hw,
+        rx,
+        stop,
+        child,
+    }
+}
+
+fn play_worker(
+    request: PlayRequest,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    tx: mpsc::SyncSender<PlayEvent>,
+) {
+    let hw = request.hw;
+    match play_decode(&request, hw, &stop, &child, &tx) {
+        Ok(()) => {}
+        Err(err) if hw != HwAccel::Off && !stop.load(Ordering::Relaxed) => {
+            let _ = tx.try_send(PlayEvent::Warning(
+                "Hardware decode failed. Using the CPU decoder instead.".into(),
+            ));
+            if let Err(soft) = play_decode(&request, HwAccel::Off, &stop, &child, &tx) {
+                let _ = tx.try_send(PlayEvent::Failed(format!(
+                    "{err}\nSoftware decode failed as well.\n{soft}"
+                )));
+            }
+        }
+        Err(err) => {
+            let _ = tx.try_send(PlayEvent::Failed(err));
+        }
+    }
+}
+
+fn play_decode(
+    request: &PlayRequest,
+    hw: HwAccel,
+    stop: &AtomicBool,
+    child_slot: &Mutex<Option<Child>>,
+    tx: &mpsc::SyncSender<PlayEvent>,
+) -> Result<(), String> {
+    let fps = if request.fps.is_finite() && (1.0..240.0).contains(&request.fps) {
+        request.fps
+    } else {
+        30.0
+    };
+    let (width, height) = preview_size(request.width, request.height);
+    if let Ok(mut slot) = child_slot.lock() {
+        if let Some(child) = slot.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *slot = None;
+    }
+    let scale = format!("scale={width}:{height}:flags=fast_bilinear");
+    let mut command = Command::new(ffmpeg_program());
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .args(hw_decode_args(hw))
+        .args(["-ss", &format!("{:.3}", request.start), "-i"])
+        .arg(&request.path)
+        .args([
+            "-map", "0:v:0", "-an", "-vf", &scale, "-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Could not start ffmpeg: {err}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg did not return a preview frame.".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffmpeg did not return a preview frame.".to_string())?;
+    {
+        let mut slot = child_slot.lock().unwrap();
+        *slot = Some(child);
+    }
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let errors_worker = Arc::clone(&errors);
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr, &mut Writer(&errors_worker));
+    });
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let frame_bytes = width as usize * height as usize * 4;
+    let mut pixels = vec![0u8; frame_bytes];
+    let mut index = 0u64;
+    let clock = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if stdout.read_exact(&mut pixels).is_err() {
+            if index == 0 {
+                let text = String::from_utf8_lossy(&errors.lock().unwrap()).to_string();
+                return Err(if text.trim().is_empty() {
+                    "ffmpeg did not return a preview frame.".into()
+                } else {
+                    tail(&text, 8)
+                });
+            }
+            let _ = tx.try_send(PlayEvent::Ended);
+            return Ok(());
+        }
+        let time = request.start + index as f64 / fps;
+        index += 1;
+        let due = Duration::from_secs_f64(index as f64 / fps);
+        if clock.elapsed().saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
+            // Behind realtime: drop the frame instead of queueing a slideshow.
+            continue;
+        }
+        while clock.elapsed() + Duration::from_millis(2) < due {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let left = due.saturating_sub(clock.elapsed());
+            thread::sleep(left.min(Duration::from_millis(8)));
+        }
+        let frame = RgbaFrame {
+            width,
+            height,
+            pixels: pixels.clone(),
+        };
+        match tx.try_send(PlayEvent::Frame { time, frame }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+        }
+    }
+}
+
+/// Small writer so a background thread can drain ffmpeg's stderr without blocking it.
+struct Writer<'a>(&'a Mutex<Vec<u8>>);
+
+impl std::io::Write for Writer<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Longest side of a preview frame. Full-resolution decode is what makes CPU playback heavy.
+pub fn preview_size(width: u32, height: u32) -> (u32, u32) {
+    const MAX: u32 = 960;
+    if width < 2 || height < 2 {
+        return (640, 360);
+    }
+    let (w, h) = if width <= MAX && height <= MAX {
+        (width, height)
+    } else {
+        let scale = (MAX as f64 / width as f64).min(MAX as f64 / height as f64);
+        (
+            (width as f64 * scale).round() as u32,
+            (height as f64 * scale).round() as u32,
+        )
+    };
+    (even_dim(w.max(2)), even_dim(h.max(2)))
 }
 
 pub fn export(
@@ -528,9 +753,8 @@ fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<Strin
         }
         parts.push(format!("format={pix}"));
     }
-    if hw_needs_upload(hw) {
-        parts.push("format=nv12".into());
-        parts.push("hwupload".into());
+    if let Some(upload) = upload_filter(hw) {
+        parts.push(upload.to_string());
     }
     if parts.is_empty() {
         None
@@ -583,7 +807,7 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
         }
     }
     let pix = output_pix_fmt(segment, hw);
-    if !hw_needs_upload(hw) {
+    if !uses_hw_upload(hw) {
         args.extend(["-pix_fmt".into(), pix]);
     }
     args.extend(color_args(segment));
@@ -638,21 +862,64 @@ fn videotoolbox_quality(crf: i32) -> i32 {
 
 /// Decode flags placed before `-i`. Empty when hardware decode is off.
 fn hw_decode_args(hw: HwAccel) -> Vec<String> {
+    let mut args = hw_device_init(hw);
     match hw {
-        HwAccel::Off => Vec::new(),
-        HwAccel::Nvidia => vec!["-hwaccel".into(), "nvdec".into()],
-        HwAccel::Intel => vec!["-hwaccel".into(), "qsv".into()],
-        HwAccel::Amd if cfg!(windows) => vec!["-hwaccel".into(), "d3d11va".into()],
-        HwAccel::Amd if cfg!(target_os = "macos") => {
-            vec!["-hwaccel".into(), "videotoolbox".into()]
-        }
-        HwAccel::Amd => vec![
+        HwAccel::Off => {}
+        HwAccel::Nvidia => args.extend(["-hwaccel".into(), "nvdec".into()]),
+        HwAccel::Intel => args.extend([
             "-hwaccel".into(),
-            "vaapi".into(),
-            "-vaapi_device".into(),
-            vaapi_device(),
-        ],
+            "qsv".into(),
+            // System-memory nv12, so a normal scale/preview filter can run.
+            // The encoder uploads again. QSV cannot take raw yuv420p by itself.
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+            "-extra_hw_frames".into(),
+            "64".into(),
+        ]),
+        HwAccel::Amd if cfg!(windows) => args.extend(["-hwaccel".into(), "d3d11va".into()]),
+        HwAccel::Amd if cfg!(target_os = "macos") => {
+            args.extend(["-hwaccel".into(), "videotoolbox".into()])
+        }
+        HwAccel::Amd => args.extend(["-hwaccel".into(), "vaapi".into()]),
     }
+    args
+}
+
+fn hw_device_init(hw: HwAccel) -> Vec<String> {
+    match hw {
+        HwAccel::Intel if cfg!(windows) => vec![
+            "-init_hw_device".into(),
+            "qsv=hw,child_device_type=d3d11va".into(),
+            "-filter_hw_device".into(),
+            "hw".into(),
+        ],
+        HwAccel::Intel => vec![
+            "-init_hw_device".into(),
+            "qsv=hw".into(),
+            "-filter_hw_device".into(),
+            "hw".into(),
+        ],
+        HwAccel::Amd if !(cfg!(windows) || cfg!(target_os = "macos")) => {
+            vec!["-vaapi_device".into(), vaapi_device()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn uses_hw_upload(hw: HwAccel) -> bool {
+    hw == HwAccel::Intel || hw_needs_upload(hw)
+}
+
+fn upload_filter(hw: HwAccel) -> Option<&'static str> {
+    if hw == HwAccel::Intel {
+        // h264_qsv on Windows only accepts QSV surfaces. Uploading nv12 is what
+        // stops the "auto_scale / Function not implemented" encoder error.
+        return Some("format=nv12,hwupload=extra_hw_frames=64");
+    }
+    if hw_needs_upload(hw) {
+        return Some("format=nv12,hwupload");
+    }
+    None
 }
 
 fn hw_needs_upload(hw: HwAccel) -> bool {
@@ -724,12 +991,10 @@ fn hw_pair_works(hw: HwAccel) -> bool {
 fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
     let mut cmd = Command::new(ffmpeg_program());
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-    if hw_needs_upload(hw) {
-        cmd.arg("-vaapi_device").arg(vaapi_device());
-    }
+    cmd.args(hw_device_init(hw));
     cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.08"]);
-    if hw_needs_upload(hw) {
-        cmd.args(["-vf", "format=nv12,hwupload"]);
+    if let Some(filter) = upload_filter(hw) {
+        cmd.args(["-vf", filter]);
     }
     cmd.args(video_encoder_args(&probe_segment(), 23, hw));
     cmd.arg(dest);
@@ -1481,6 +1746,19 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(intel
             .windows(2)
             .any(|pair| pair == ["-global_quality", "18"]));
+        assert!(!intel.iter().any(|arg| arg == "-pix_fmt"));
+        assert_eq!(
+            video_filter(&segment, &target, HwAccel::Intel).as_deref(),
+            Some("format=nv12,hwupload=extra_hw_frames=64")
+        );
+        let qsv = hw_decode_args(HwAccel::Intel);
+        assert!(qsv.windows(2).any(|pair| pair == ["-hwaccel", "qsv"]));
+        assert!(qsv
+            .windows(2)
+            .any(|pair| pair == ["-hwaccel_output_format", "nv12"]));
+        assert!(qsv.iter().any(|arg| arg.contains("qsv=hw")));
+        assert_eq!(preview_size(1920, 1080), (960, 540));
+        assert_eq!(preview_size(160, 120), (160, 120));
         assert_eq!(videotoolbox_quality(0), 100);
         assert_eq!(videotoolbox_quality(18), 64);
         assert_eq!(videotoolbox_quality(51), 1);
@@ -1558,6 +1836,31 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             frame.pixels.len(),
             frame.width as usize * frame.height as usize * 4
         );
+
+        let session = spawn_play(PlayRequest {
+            path: src.clone(),
+            start: 0.0,
+            fps: info.fps,
+            width: info.width,
+            height: info.height,
+            hw: HwAccel::Off,
+        });
+        let started = std::time::Instant::now();
+        let mut played = false;
+        while started.elapsed() < std::time::Duration::from_secs(8) {
+            match session.try_recv() {
+                Ok(PlayEvent::Frame { frame, .. }) => {
+                    assert!(frame.width > 0 && frame.height > 0);
+                    played = true;
+                    break;
+                }
+                Ok(PlayEvent::Failed(err)) => panic!("playback failed: {err}"),
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        drop(session);
+        assert!(played, "playback did not produce a frame");
 
         let segment = |start: f64, end: f64| info.segment(src.clone(), start, end);
         let dest = dir.join("joined.mp4");
