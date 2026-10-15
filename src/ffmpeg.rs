@@ -717,11 +717,7 @@ fn compatible_args(
 }
 
 /// Filters only when something about the picture must change to match `target`.
-/// Windows Intel always returns a filter: the frames stay on the GPU.
 fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<String> {
-    if hw == HwAccel::Intel && cfg!(windows) {
-        return Some(intel_windows_filter(segment, target));
-    }
     let mut parts = Vec::new();
     let size_differs = segment.width != target.width || segment.height != target.height;
     if size_differs {
@@ -811,7 +807,11 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
         }
     }
     let pix = output_pix_fmt(segment, hw);
-    if !uses_hw_upload(hw) {
+    if hw == HwAccel::Intel && cfg!(windows) {
+        // System-memory nv12. Quick Sync uploads it itself. Do not use yuv420p:
+        // that made ffmpeg insert an auto_scale the encoder cannot accept.
+        args.extend(["-pix_fmt".into(), "nv12".into()]);
+    } else if !uses_hw_upload(hw) {
         args.extend(["-pix_fmt".into(), pix]);
     }
     args.extend(color_args(segment));
@@ -898,19 +898,12 @@ fn hw_decode_args(hw: HwAccel) -> Vec<String> {
     }
 }
 
-/// Decode plus the device the encoder uploads into. Export only.
+/// Decode flags for export. Windows Intel matches playback: D3D11 decode,
+/// then normal nv12 frames. Keeping the frames as D3D11 surfaces overflowed
+/// the pool (`Static surface pool size exceeded`).
 fn export_input_args(hw: HwAccel) -> Vec<String> {
     if hw == HwAccel::Intel && cfg!(windows) {
-        // Keep the D3D11 textures and map them into Quick Sync.
-        // `hwupload` was failing here with "Could not create the texture (80070057)".
-        return vec![
-            "-hwaccel".into(),
-            "d3d11va".into(),
-            "-hwaccel_output_format".into(),
-            "d3d11".into(),
-            "-extra_hw_frames".into(),
-            "64".into(),
-        ];
+        return hw_decode_args(HwAccel::Intel);
     }
     if hw == HwAccel::Intel {
         return vec![
@@ -968,23 +961,6 @@ fn upload_filter(hw: HwAccel) -> Option<&'static str> {
         return Some("format=nv12,hwupload");
     }
     None
-}
-
-/// Map D3D11 decode surfaces into Quick Sync. No `hwupload`, so ffmpeg does not
-/// have to allocate a new texture from system memory.
-fn intel_windows_filter(segment: &Segment, target: &Target) -> String {
-    let mut chain = String::from("hwmap=derive_device=qsv,format=qsv");
-    let size_differs = segment.width != target.width || segment.height != target.height;
-    let fps_differs = (segment.fps - target.fps).abs() > 0.01;
-    if size_differs || fps_differs {
-        let mut vpp = format!("vpp_qsv=w={}:h={}", target.width, target.height);
-        if fps_differs {
-            vpp.push_str(&format!(":framerate={}", format_fps(target.fps)));
-        }
-        chain.push(',');
-        chain.push_str(&vpp);
-    }
-    chain
 }
 
 fn hw_needs_upload(hw: HwAccel) -> bool {
