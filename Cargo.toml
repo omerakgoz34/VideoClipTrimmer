@@ -1,8 +1,8 @@
 [package]
-name = "videocliptrimmer"
+name = "video-clip-trimmer"
 version = "0.2.0"
 edition = "2021"
-description = "Cut and merge video clips. A small native desktop app that drives ffmpeg."
+description = "A simple yet useful program to trim and merge video clips."
 license = "MIT"
 
 [[bin]]
@@ -25,4 +25,4 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 [profile.release]
 lto = "thin"
 strip = true
-opt-level = 3
+opt-level = 2
