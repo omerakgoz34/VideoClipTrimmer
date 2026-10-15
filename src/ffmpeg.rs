@@ -658,7 +658,7 @@ fn compatible_args(
     ];
     // Hardware decode of the source. Frames are still filtered on the CPU,
     // then handed to the hardware encoder below.
-    args.extend(hw_decode_args(hw));
+    args.extend(export_input_args(hw));
     args.extend([
         // `-ss` before `-i` is fast. Re-encoding still starts near the requested frame,
         // because ffmpeg decodes back to the previous keyframe.
@@ -860,28 +860,80 @@ fn videotoolbox_quality(crf: i32) -> i32 {
     (((51 - crf) * 100) / 51).clamp(1, 100)
 }
 
-/// Decode flags placed before `-i`. Empty when hardware decode is off.
+/// Flags that go before `-i` while playing or grabbing one frame.
+///
+/// Intel on Windows uses D3D11 here, not `-hwaccel qsv`. The QSV decoder
+/// fails on a lot of Intel laptops (`Error number -1145393733`) even when
+/// other apps decode on the same GPU.
 fn hw_decode_args(hw: HwAccel) -> Vec<String> {
-    let mut args = hw_device_init(hw);
     match hw {
-        HwAccel::Off => {}
-        HwAccel::Nvidia => args.extend(["-hwaccel".into(), "nvdec".into()]),
-        HwAccel::Intel => args.extend([
+        HwAccel::Off => Vec::new(),
+        HwAccel::Nvidia => vec!["-hwaccel".into(), "nvdec".into()],
+        HwAccel::Intel if cfg!(windows) => vec![
             "-hwaccel".into(),
-            "qsv".into(),
-            // System-memory nv12, so a normal scale/preview filter can run.
-            // The encoder uploads again. QSV cannot take raw yuv420p by itself.
+            "d3d11va".into(),
             "-hwaccel_output_format".into(),
             "nv12".into(),
-            "-extra_hw_frames".into(),
-            "64".into(),
-        ]),
-        HwAccel::Amd if cfg!(windows) => args.extend(["-hwaccel".into(), "d3d11va".into()]),
+        ],
+        HwAccel::Intel => vec![
+            "-hwaccel".into(),
+            "qsv".into(),
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+        ],
+        HwAccel::Amd if cfg!(windows) => vec!["-hwaccel".into(), "d3d11va".into()],
         HwAccel::Amd if cfg!(target_os = "macos") => {
-            args.extend(["-hwaccel".into(), "videotoolbox".into()])
+            vec!["-hwaccel".into(), "videotoolbox".into()]
         }
-        HwAccel::Amd => args.extend(["-hwaccel".into(), "vaapi".into()]),
+        HwAccel::Amd => vec![
+            "-vaapi_device".into(),
+            vaapi_device(),
+            "-hwaccel".into(),
+            "vaapi".into(),
+        ],
     }
+}
+
+/// Decode plus the device the encoder uploads into. Export only.
+fn export_input_args(hw: HwAccel) -> Vec<String> {
+    if hw == HwAccel::Intel && cfg!(windows) {
+        // One D3D11 device, then Quick Sync derived from it. A second QSV
+        // device (`-hwaccel qsv` plus `hwupload`) is what broke the frame pool.
+        return vec![
+            "-init_hw_device".into(),
+            "d3d11va=d3d".into(),
+            "-init_hw_device".into(),
+            "qsv=qs@d3d".into(),
+            "-filter_hw_device".into(),
+            "qs".into(),
+            "-hwaccel".into(),
+            "d3d11va".into(),
+            "-hwaccel_device".into(),
+            "d3d".into(),
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+        ];
+    }
+    if hw == HwAccel::Intel {
+        return vec![
+            "-init_hw_device".into(),
+            "qsv=hw".into(),
+            "-filter_hw_device".into(),
+            "hw".into(),
+            "-hwaccel".into(),
+            "qsv".into(),
+            "-hwaccel_device".into(),
+            "hw".into(),
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+        ];
+    }
+    let mut args = hw_device_init(hw);
+    // VAAPI already puts its device in the decode flags.
+    if hw == HwAccel::Amd && !(cfg!(windows) || cfg!(target_os = "macos")) {
+        args.clear();
+    }
+    args.extend(hw_decode_args(hw));
     args
 }
 
@@ -889,9 +941,11 @@ fn hw_device_init(hw: HwAccel) -> Vec<String> {
     match hw {
         HwAccel::Intel if cfg!(windows) => vec![
             "-init_hw_device".into(),
-            "qsv=hw,child_device_type=d3d11va".into(),
+            "d3d11va=d3d".into(),
+            "-init_hw_device".into(),
+            "qsv=qs@d3d".into(),
             "-filter_hw_device".into(),
-            "hw".into(),
+            "qs".into(),
         ],
         HwAccel::Intel => vec![
             "-init_hw_device".into(),
@@ -912,9 +966,8 @@ fn uses_hw_upload(hw: HwAccel) -> bool {
 
 fn upload_filter(hw: HwAccel) -> Option<&'static str> {
     if hw == HwAccel::Intel {
-        // h264_qsv on Windows only accepts QSV surfaces. Uploading nv12 is what
-        // stops the "auto_scale / Function not implemented" encoder error.
-        return Some("format=nv12,hwupload=extra_hw_frames=64");
+        // `format=qsv` stops ffmpeg inserting auto_scale in front of h264_qsv.
+        return Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv");
     }
     if hw_needs_upload(hw) {
         return Some("format=nv12,hwupload");
@@ -1749,14 +1802,19 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(!intel.iter().any(|arg| arg == "-pix_fmt"));
         assert_eq!(
             video_filter(&segment, &target, HwAccel::Intel).as_deref(),
-            Some("format=nv12,hwupload=extra_hw_frames=64")
+            Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv")
         );
         let qsv = hw_decode_args(HwAccel::Intel);
         assert!(qsv.windows(2).any(|pair| pair == ["-hwaccel", "qsv"]));
         assert!(qsv
             .windows(2)
             .any(|pair| pair == ["-hwaccel_output_format", "nv12"]));
-        assert!(qsv.iter().any(|arg| arg.contains("qsv=hw")));
+        assert!(!qsv.iter().any(|arg| arg.contains("init_hw_device")));
+        let export = export_input_args(HwAccel::Intel);
+        assert!(export.iter().any(|arg| arg.contains("qsv=hw")));
+        assert!(export
+            .windows(2)
+            .any(|pair| pair == ["-hwaccel_device", "hw"]));
         assert_eq!(preview_size(1920, 1080), (960, 540));
         assert_eq!(preview_size(160, 120), (160, 120));
         assert_eq!(videotoolbox_quality(0), 100);
