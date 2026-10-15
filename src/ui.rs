@@ -41,6 +41,8 @@ pub struct App {
     hw_touched: bool,
     hw_detect: Option<Receiver<HwAccel>>,
     hw_warned: bool,
+    /// True after this playback session gave up on the hardware decoder.
+    play_using_cpu: bool,
     path_text: String,
     notice: Notice,
     log: String,
@@ -121,6 +123,7 @@ impl App {
             hw_touched,
             hw_detect,
             hw_warned: false,
+            play_using_cpu: false,
             path_text: String::new(),
             notice: Notice::None,
             log: String::new(),
@@ -487,6 +490,7 @@ impl App {
             ui.radio_value(&mut self.hw, HwAccel::Intel, "Intel");
             if self.hw != previous {
                 self.hw_warned = false;
+                self.clear_hw_fallback_notice();
                 self.hw_touched = true;
                 self.play = None;
                 save_hw(self.hw);
@@ -723,6 +727,8 @@ impl App {
                 }
                 if let Some(warning) = warning {
                     self.note_hw_fallback(&warning);
+                } else if self.hw != HwAccel::Off {
+                    self.clear_hw_fallback_notice();
                 }
             }
         }
@@ -771,6 +777,7 @@ impl App {
             .map(|play| play.path != path || play.hw != hw)
             .unwrap_or(true);
         if restart {
+            self.play_using_cpu = false;
             self.play = Some(spawn_play(PlayRequest {
                 path,
                 start: self.playhead,
@@ -780,46 +787,62 @@ impl App {
                 hw,
             }));
         }
-        let Some(play) = &self.play else {
-            return;
-        };
-        let mut latest = None;
-        while let Ok(event) = play.try_recv() {
-            latest = Some(event);
-        }
-        let Some(event) = latest else {
-            return;
-        };
-        match event {
-            PlayEvent::Warning(text) => self.note_hw_fallback(&text),
-            PlayEvent::Frame { time, frame } => {
-                if time >= self.out_point - 0.02 {
-                    self.play = None;
-                    if self.loop_range {
-                        self.playhead = self.in_point;
-                        self.shown_time = None;
-                    } else {
-                        self.playhead = self.out_point.min(self.duration());
-                        self.playing = false;
-                    }
-                    return;
-                }
-                self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
-                self.playhead = time;
+        let events = {
+            let Some(play) = &self.play else {
+                return;
+            };
+            let mut events = Vec::new();
+            while let Ok(event) = play.try_recv() {
+                events.push(event);
             }
-            PlayEvent::Ended => {
+            events
+        };
+        let mut frame = None;
+        let mut ended = false;
+        let mut failed = None;
+        for event in events {
+            match event {
+                PlayEvent::Warning(text) => {
+                    self.play_using_cpu = true;
+                    self.note_hw_fallback(&text);
+                }
+                PlayEvent::Frame { time, frame: image } => frame = Some((time, image)),
+                PlayEvent::Ended => ended = true,
+                PlayEvent::Failed(err) => failed = Some(err),
+            }
+        }
+        if let Some(err) = failed {
+            self.play = None;
+            self.playing = false;
+            self.fail(format!("Preview: {err}"));
+            return;
+        }
+        if let Some((time, image)) = frame {
+            if !self.play_using_cpu {
+                self.clear_hw_fallback_notice();
+            }
+            if time >= self.out_point - 0.02 {
                 self.play = None;
                 if self.loop_range {
                     self.playhead = self.in_point;
                     self.shown_time = None;
                 } else {
+                    self.playhead = self.out_point.min(self.duration());
                     self.playing = false;
                 }
+                return;
             }
-            PlayEvent::Failed(err) => {
-                self.play = None;
+            self.present_frame(ctx, &image.pixels, image.width, image.height, time);
+            self.playhead = time;
+            return;
+        }
+        if ended {
+            self.play = None;
+            if self.loop_range {
+                self.playhead = self.in_point;
+                self.shown_time = None;
+            } else {
                 self.playing = false;
-                self.fail(format!("Preview: {err}"));
             }
         }
     }
@@ -851,6 +874,17 @@ impl App {
         let line = warning.lines().next().unwrap_or(warning).to_string();
         self.info(line);
         self.push_log(warning.to_string());
+    }
+
+    fn clear_hw_fallback_notice(&mut self) {
+        let showing = matches!(
+            &self.notice,
+            Notice::Info(text) if text.starts_with("Hardware decode failed")
+        );
+        if showing {
+            self.notice = Notice::None;
+            self.hw_warned = false;
+        }
     }
 
     fn poll_job(&mut self) {

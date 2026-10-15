@@ -907,18 +907,26 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
             ]);
         }
         HwAccel::Nvidia => {
-            // NVENC's `-cq` uses the same 0–51 scale as x264 CRF.
+            // HandBrake's quality mode: CQ with no bitrate cap, spatial AQ on.
+            // `p4` is its balanced preset. `-b:v 0` stops the default bitrate
+            // from overriding the quality number.
             args.extend([
                 "-c:v".into(),
                 "h264_nvenc".into(),
                 "-preset".into(),
-                "p5".into(),
+                "p4".into(),
                 "-tune".into(),
                 "hq".into(),
                 "-rc".into(),
                 "vbr".into(),
                 "-cq".into(),
                 quality,
+                "-b:v".into(),
+                "0".into(),
+                "-spatial-aq".into(),
+                "1".into(),
+                "-profile:v".into(),
+                "high".into(),
             ]);
         }
         HwAccel::Amd => args.extend(amd_encoder_args(&quality)),
@@ -935,9 +943,12 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
         }
     }
     let pix = output_pix_fmt(segment, hw);
-    if hw == HwAccel::Intel && cfg!(windows) {
-        // System-memory nv12. Quick Sync uploads it itself. Do not use yuv420p:
-        // that made ffmpeg insert an auto_scale the encoder cannot accept.
+    if (hw == HwAccel::Intel && cfg!(windows))
+        || hw == HwAccel::Nvidia
+        || (hw == HwAccel::Amd && cfg!(windows))
+    {
+        // NVENC and AMF take nv12, the same layout HandBrake feeds them.
+        // yuv420p makes ffmpeg insert a conversion the encoder may reject.
         args.extend(["-pix_fmt".into(), "nv12".into()]);
     } else if !uses_hw_upload(hw) {
         args.extend(["-pix_fmt".into(), pix]);
@@ -948,11 +959,14 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
 
 fn amd_encoder_args(crf: &str) -> Vec<String> {
     if cfg!(windows) {
+        // CQP is HandBrake's AMD quality mode. `balanced` is its default speed.
         vec![
             "-c:v".into(),
             "h264_amf".into(),
+            "-usage".into(),
+            "transcoding".into(),
             "-quality".into(),
-            "quality".into(),
+            "balanced".into(),
             "-rc".into(),
             "cqp".into(),
             "-qp_i".into(),
@@ -961,6 +975,8 @@ fn amd_encoder_args(crf: &str) -> Vec<String> {
             crf.to_string(),
             "-qp_b".into(),
             crf.to_string(),
+            "-profile:v".into(),
+            "high".into(),
         ]
     } else if cfg!(target_os = "macos") {
         // Macs have no AMF encoder. VideoToolbox is the hardware encoder there.
@@ -1000,7 +1016,14 @@ fn videotoolbox_quality(crf: i32) -> i32 {
 fn hw_decode_args(hw: HwAccel) -> Vec<String> {
     match hw {
         HwAccel::Off => Vec::new(),
-        HwAccel::Nvidia => vec!["-hwaccel".into(), "nvdec".into()],
+        // CUDA is NVDEC. HandBrake decodes there and keeps NV12.
+        // `nvdec` is only an alias, and some builds do not accept it.
+        HwAccel::Nvidia => vec![
+            "-hwaccel".into(),
+            "cuda".into(),
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+        ],
         HwAccel::Intel if cfg!(windows) => vec![
             "-hwaccel".into(),
             "d3d11va".into(),
@@ -1013,7 +1036,18 @@ fn hw_decode_args(hw: HwAccel) -> Vec<String> {
             "-hwaccel_output_format".into(),
             "nv12".into(),
         ],
-        HwAccel::Amd if cfg!(windows) => vec!["-hwaccel".into(), "d3d11va".into()],
+        // D3D11VA on the AMD adapter. The AMF decoder itself fails to open.
+        // 0x1002 is AMD's vendor id, so a second GPU is not picked by mistake.
+        HwAccel::Amd if cfg!(windows) => vec![
+            "-init_hw_device".into(),
+            "d3d11va=amd,vendor=0x1002".into(),
+            "-hwaccel".into(),
+            "d3d11va".into(),
+            "-hwaccel_device".into(),
+            "amd".into(),
+            "-hwaccel_output_format".into(),
+            "nv12".into(),
+        ],
         HwAccel::Amd if cfg!(target_os = "macos") => {
             vec!["-hwaccel".into(), "videotoolbox".into()]
         }
@@ -1976,7 +2010,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
 
         let nvidia = video_encoder_args(&segment, 18, HwAccel::Nvidia);
         assert!(nvidia.windows(2).any(|pair| pair == ["-cq", "18"]));
-        assert!(!nvidia.iter().any(|arg| arg == "-b:v"));
+        assert!(nvidia.windows(2).any(|pair| pair == ["-b:v", "0"]));
+        assert!(nvidia.windows(2).any(|pair| pair == ["-pix_fmt", "nv12"]));
         let intel = video_encoder_args(&segment, 18, HwAccel::Intel);
         assert!(intel
             .windows(2)
@@ -2009,7 +2044,10 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
     #[test]
     fn nvidia_decode_is_requested_when_that_encoder_is_on() {
         let args = hw_decode_args(HwAccel::Nvidia);
-        assert_eq!(args, ["-hwaccel", "nvdec"]);
+        assert!(args.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-hwaccel_output_format", "nv12"]));
         assert_eq!(normalize_bitrate("8M").unwrap(), "8M");
         assert_eq!(normalize_bitrate("192").unwrap(), "192k");
         assert!(normalize_bitrate("nope").is_err());
