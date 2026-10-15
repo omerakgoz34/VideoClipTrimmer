@@ -19,7 +19,7 @@ fn main() {
     };
 
     let conf = mq::conf::Conf {
-        window_title: "VideoClipTrimmer".to_owned(),
+        window_title: format!("VideoClipTrimmer {}", env!("CARGO_PKG_VERSION")),
         window_width: 1280,
         window_height: 720,
         high_dpi: true,

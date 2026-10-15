@@ -257,6 +257,7 @@ impl App {
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.heading("VideoClipTrimmer");
+            ui.label(muted(env!("CARGO_PKG_VERSION")));
             ui.add_space(8.0);
             if let Some(media) = &self.media {
                 ui.label(file_label(&media.path));

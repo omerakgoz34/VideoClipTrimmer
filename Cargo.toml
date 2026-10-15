@@ -1,6 +1,6 @@
 [package]
 name = "videocliptrimmer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Cut and merge video clips. A small native desktop app that drives ffmpeg."
 license = "MIT"
