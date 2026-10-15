@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Instant;
 
 use crate::ffmpeg::{
-    self, check_ffmpeg, export, spawn_grab, EncodeMode, ExportError, Grabbed, Hooks, MediaInfo,
-    Segment,
+    self, check_ffmpeg, export, spawn_grab, EncodeMode, EncodeSettings, ExportError, Grabbed,
+    Hooks, HwAccel, MediaInfo, Segment,
 };
 use crate::timeutil::{format_time, parse_time};
 
@@ -34,6 +34,11 @@ pub struct App {
     clips: Vec<Clip>,
     selected: Option<usize>,
     mode: EncodeMode,
+    video_bitrate: String,
+    audio_bitrate: String,
+    bitrate_edited: bool,
+    hw: HwAccel,
+    hw_warned: bool,
     path_text: String,
     notice: Notice,
     log: String,
@@ -97,6 +102,11 @@ impl App {
             clips: Vec::new(),
             selected: None,
             mode: EncodeMode::Compatible,
+            video_bitrate: "8000k".to_string(),
+            audio_bitrate: "192k".to_string(),
+            bitrate_edited: false,
+            hw: HwAccel::Off,
+            hw_warned: false,
             path_text: String::new(),
             notice: Notice::None,
             log: String::new(),
@@ -228,7 +238,8 @@ impl App {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| match &self.ffmpeg {
                     Ok(version) => {
-                        ui.label(muted("ffmpeg")).on_hover_text(version);
+                        ui.label(muted(&ffmpeg_label(version)))
+                            .on_hover_text(version);
                     }
                     Err(_) => {
                         ui.colored_label(rgb(0xe0, 0x7a, 0x5f), "ffmpeg missing");
@@ -415,12 +426,46 @@ impl App {
             ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Compatible");
             ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast copy");
         });
+        if self.mode == EncodeMode::Compatible {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Video bitrate");
+                let video = ui.add(
+                    egui::TextEdit::singleline(&mut self.video_bitrate)
+                        .desired_width(88.0)
+                        .hint_text("8000k"),
+                );
+                ui.label("Audio bitrate");
+                let audio = ui.add(
+                    egui::TextEdit::singleline(&mut self.audio_bitrate)
+                        .desired_width(72.0)
+                        .hint_text("192k"),
+                );
+                if video.changed() || audio.changed() {
+                    self.bitrate_edited = true;
+                }
+                ui.label(muted("8000k or 8M"));
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Hardware");
+            let previous = self.hw;
+            ui.radio_value(&mut self.hw, HwAccel::Off, "Off");
+            ui.radio_value(&mut self.hw, HwAccel::Nvidia, "NVIDIA");
+            ui.radio_value(&mut self.hw, HwAccel::Amd, "AMD");
+            ui.radio_value(&mut self.hw, HwAccel::Intel, "Intel");
+            if self.hw != previous {
+                self.hw_warned = false;
+                if self.media.is_some() {
+                    self.wanted_time = Some(self.playhead);
+                }
+            }
+        });
         ui.label(muted(match self.mode {
             EncodeMode::Compatible => {
-                "Re-encodes so clips of different sizes and codecs can be joined. Needs libx264."
+                "Re-encodes at the bitrates above. Size, frame rate, and color tags stay as they are, unless clips must be matched to the first one. Hardware also decodes the preview."
             }
             EncodeMode::FastCopy => {
-                "No re-encode. A cut starts near the previous keyframe. Joins need matching files."
+                "No re-encode. A cut starts near the previous keyframe. Joins need matching files. Hardware still decodes the preview when it is on."
             }
         }));
 
@@ -639,7 +684,13 @@ impl App {
         if finished.is_some() {
             self.grab = None;
         }
-        if let Some(Grabbed { seq, time, result }) = finished {
+        if let Some(Grabbed {
+            seq,
+            time,
+            result,
+            warning,
+        }) = finished
+        {
             if seq == self.grab_seq {
                 match result {
                     Ok(frame) => {
@@ -654,6 +705,13 @@ impl App {
                             self.preview = Some(ctx.load_texture("preview", image, options));
                         }
                         self.shown_time = Some(time);
+                        if let Some(warning) = warning {
+                            if !self.hw_warned {
+                                self.hw_warned = true;
+                                self.info(warning.lines().next().unwrap_or(&warning).to_string());
+                                self.push_log(warning);
+                            }
+                        }
                     }
                     Err(err) => self.fail(format!("Preview: {err}")),
                 }
@@ -684,7 +742,7 @@ impl App {
             0.0
         };
         self.grab_seq += 1;
-        self.grab = Some(spawn_grab(path, time, self.grab_seq));
+        self.grab = Some(spawn_grab(path, time, self.grab_seq, self.hw));
         self.wanted_time = None;
     }
 
@@ -741,6 +799,7 @@ impl App {
         match ffmpeg::probe(&path) {
             Ok(info) => {
                 let duration = info.duration;
+                self.apply_source_bitrates(&info);
                 self.media = Some(Loaded { path, info });
                 self.preview = None;
                 self.shown_time = None;
@@ -850,21 +909,19 @@ impl App {
         let Some(media) = &self.media else {
             return;
         };
-        let segment = Segment {
-            path: media.path.clone(),
-            start: self.in_point,
-            end: self.out_point,
-            width: media.info.width,
-            height: media.info.height,
-            fps: media.info.fps,
-            has_audio: media.info.has_audio,
-        };
+        let segment = media
+            .info
+            .segment(media.path.clone(), self.in_point, self.out_point);
         let suggested = suggested_name(&file_label(&media.path), "-cut");
         self.start_export(vec![segment], suggested);
     }
 
     fn export_list(&mut self) {
-        let segments: Vec<Segment> = self.clips.iter().map(Clip::segment).collect();
+        let segments: Vec<_> = self
+            .clips
+            .iter()
+            .map(|clip| clip.info.segment(clip.path.clone(), clip.start, clip.end))
+            .collect();
         self.start_export(segments, "videocliptrimmer.mp4".into());
     }
 
@@ -887,6 +944,11 @@ impl App {
         let dest = ensure_mp4(dest);
         let job_dest = dest.clone();
         let mode = self.mode;
+        let settings = EncodeSettings {
+            video_bitrate: self.video_bitrate.clone(),
+            audio_bitrate: self.audio_bitrate.clone(),
+            hw: self.hw,
+        };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -902,7 +964,7 @@ impl App {
                 },
                 cancel: &cancel_worker,
             };
-            let result = export(&segments, &dest, mode, &hooks);
+            let result = export(&segments, &dest, mode, &settings, &hooks);
             let _ = tx.send(JobMsg::Finished(result));
         });
         let message = format!("Exporting to {}…", job_dest.display());
@@ -944,6 +1006,18 @@ impl App {
         self.playing = false;
         self.playhead = time.clamp(0.0, self.duration());
         self.wanted_time = Some(self.playhead);
+    }
+
+    fn apply_source_bitrates(&mut self, info: &MediaInfo) {
+        if self.bitrate_edited {
+            return;
+        }
+        if let Some(bits) = info.video_bitrate {
+            self.video_bitrate = format_kbps(bits);
+        }
+        if let Some(bits) = info.audio_bitrate {
+            self.audio_bitrate = format_kbps(bits);
+        }
     }
 
     fn duration(&self) -> f64 {
@@ -1017,18 +1091,6 @@ impl Clip {
             info,
         }
     }
-
-    fn segment(&self) -> Segment {
-        Segment {
-            path: self.path.clone(),
-            start: self.start,
-            end: self.end,
-            width: self.info.width,
-            height: self.info.height,
-            fps: self.info.fps,
-            has_audio: self.info.has_audio,
-        }
-    }
 }
 
 fn timeline(
@@ -1095,6 +1157,20 @@ fn muted(text: &str) -> egui::RichText {
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
+}
+
+fn ffmpeg_label(version: &str) -> String {
+    let rest = version
+        .trim()
+        .strip_prefix("ffmpeg version ")
+        .unwrap_or(version.trim());
+    let number = rest.split_whitespace().next().unwrap_or(rest);
+    format!("ffmpeg {number}")
+}
+
+fn format_kbps(bits_per_second: u64) -> String {
+    let kbps = ((bits_per_second as f64) / 1000.0).round() as u64;
+    format!("{kbps}k")
 }
 
 fn file_label(path: &Path) -> String {

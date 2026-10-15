@@ -23,6 +23,27 @@ pub enum EncodeMode {
     FastCopy,
 }
 
+/// Which hardware encoder to use. `Off` is libx264 on the CPU.
+///
+/// Preview uses the matching hardware decoder while this is not `Off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwAccel {
+    Off,
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+/// Bitrates used when `EncodeMode::Compatible` re-encodes.
+///
+/// Strings are ffmpeg rates such as `8000k` or `192k`.
+#[derive(Clone, Debug)]
+pub struct EncodeSettings {
+    pub video_bitrate: String,
+    pub audio_bitrate: String,
+    pub hw: HwAccel,
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaInfo {
     pub duration: f64,
@@ -32,6 +53,17 @@ pub struct MediaInfo {
     pub has_audio: bool,
     pub video_codec: String,
     pub audio_codec: String,
+    /// Pixel format without the extra tags, for example `yuv420p`.
+    pub pix_fmt: String,
+    /// `tv` (limited), `pc` (full), or empty when ffmpeg did not say.
+    pub color_range: String,
+    /// ffmpeg color names. Empty when the file did not say.
+    pub color_space: String,
+    pub color_primaries: String,
+    pub color_transfer: String,
+    /// Bits per second, when the probe printed a stream bitrate.
+    pub video_bitrate: Option<u64>,
+    pub audio_bitrate: Option<u64>,
 }
 
 /// One range of one file, ready to export.
@@ -44,6 +76,30 @@ pub struct Segment {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    pub pix_fmt: String,
+    pub color_range: String,
+    pub color_space: String,
+    pub color_primaries: String,
+    pub color_transfer: String,
+}
+
+impl MediaInfo {
+    pub fn segment(&self, path: PathBuf, start: f64, end: f64) -> Segment {
+        Segment {
+            path,
+            start,
+            end,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            has_audio: self.has_audio,
+            pix_fmt: self.pix_fmt.clone(),
+            color_range: self.color_range.clone(),
+            color_space: self.color_space.clone(),
+            color_primaries: self.color_primaries.clone(),
+            color_transfer: self.color_transfer.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -129,18 +185,42 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
     })
 }
 
-pub fn grab_frame(path: &Path, time: f64) -> Result<RgbaFrame, String> {
-    let args = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-ss",
-        &format!("{time:.3}"),
-        "-i",
-    ];
+pub struct GrabOutcome {
+    pub frame: RgbaFrame,
+    pub warning: Option<String>,
+}
+
+pub fn grab_frame(path: &Path, time: f64, hw: HwAccel) -> Result<GrabOutcome, String> {
+    if hw == HwAccel::Off {
+        let frame = grab_frame_once(path, time, HwAccel::Off)?;
+        return Ok(GrabOutcome {
+            frame,
+            warning: None,
+        });
+    }
+    match grab_frame_once(path, time, hw) {
+        Ok(frame) => Ok(GrabOutcome {
+            frame,
+            warning: None,
+        }),
+        Err(err) => match grab_frame_once(path, time, HwAccel::Off) {
+            Ok(frame) => Ok(GrabOutcome {
+                frame,
+                warning: Some(format!(
+                    "Hardware decode failed. Using the CPU decoder instead.\n{err}"
+                )),
+            }),
+            Err(soft) => Err(format!("{err}\nSoftware decode failed as well.\n{soft}")),
+        },
+    }
+}
+
+fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, String> {
     let mut command = Command::new(ffmpeg_program());
     command
-        .args(args)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(hw_decode_args(hw))
+        .args(["-ss", &format!("{time:.3}"), "-i"])
         .arg(path)
         .args([
             "-frames:v",
@@ -181,6 +261,7 @@ pub fn export(
     segments: &[Segment],
     dest: &Path,
     mode: EncodeMode,
+    settings: &EncodeSettings,
     hooks: &Hooks<'_>,
 ) -> Result<(), ExportError> {
     if segments.is_empty() {
@@ -198,7 +279,7 @@ pub fn export(
 
     if segments.len() == 1 {
         (hooks.progress)(0.0);
-        encode_segment(&segments[0], dest, mode, None, hooks, 0.0, 1.0)?;
+        encode_segment(&segments[0], dest, mode, None, settings, hooks, (0.0, 1.0))?;
         (hooks.progress)(1.0);
         return Ok(());
     }
@@ -213,7 +294,7 @@ pub fn export(
         let end = encode_share * (index as f32 + 1.0) / segments.len() as f32;
         // Joined clips have to share a size. The first clip decides it.
         let target = Some(output_target(&segments[0]));
-        encode_segment(segment, &part, mode, target, hooks, start, end)?;
+        encode_segment(segment, &part, mode, target, settings, hooks, (start, end))?;
         parts.push(part);
     }
 
@@ -265,16 +346,28 @@ fn encode_segment(
     dest: &Path,
     mode: EncodeMode,
     target: Option<Target>,
+    settings: &EncodeSettings,
     hooks: &Hooks<'_>,
-    progress_from: f32,
-    progress_to: f32,
+    progress: (f32, f32),
 ) -> Result<(), ExportError> {
     let progress_path = dest.with_extension("progress");
     let args = match mode {
         EncodeMode::FastCopy => fast_copy_args(segment, dest, &progress_path),
         EncodeMode::Compatible => {
+            let video_bitrate = normalize_bitrate(&settings.video_bitrate)
+                .map_err(|err| ExportError::Message(format!("Video bitrate: {err}")))?;
+            let audio_bitrate = normalize_bitrate(&settings.audio_bitrate)
+                .map_err(|err| ExportError::Message(format!("Audio bitrate: {err}")))?;
             let target = target.unwrap_or_else(|| output_target(segment));
-            compatible_args(segment, dest, &target, &progress_path)
+            compatible_args(
+                segment,
+                dest,
+                &target,
+                &progress_path,
+                &video_bitrate,
+                &audio_bitrate,
+                settings.hw,
+            )
         }
     };
     let duration = (segment.end - segment.start).max(0.05);
@@ -283,8 +376,8 @@ fn encode_segment(
         &progress_path,
         duration,
         hooks,
-        progress_from,
-        progress_to,
+        progress.0,
+        progress.1,
     )?;
     let _ = std::fs::remove_file(&progress_path);
     Ok(())
@@ -324,14 +417,11 @@ fn compatible_args(
     dest: &Path,
     target: &Target,
     progress: &Path,
+    video_bitrate: &str,
+    audio_bitrate: &str,
+    hw: HwAccel,
 ) -> Vec<String> {
     let duration = segment.end - segment.start;
-    let filter = format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps}",
-        w = target.width,
-        h = target.height,
-        fps = format_fps(target.fps),
-    );
     let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
@@ -340,6 +430,11 @@ fn compatible_args(
         progress.display().to_string(),
         "-loglevel".into(),
         "error".into(),
+    ];
+    // Hardware decode of the source. Frames are still filtered on the CPU,
+    // then handed to the hardware encoder below.
+    args.extend(hw_decode_args(hw));
+    args.extend([
         // `-ss` before `-i` is fast. Re-encoding still starts near the requested frame,
         // because ffmpeg decodes back to the previous keyframe.
         "-ss".into(),
@@ -348,33 +443,10 @@ fn compatible_args(
         format!("{:.3}", duration),
         "-i".into(),
         segment.path.display().to_string(),
-    ];
+    ]);
 
     if segment.has_audio {
-        args.extend([
-            "-map".into(),
-            "0:v:0".into(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-vf".into(),
-            filter,
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            "veryfast".into(),
-            "-crf".into(),
-            "20".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "160k".into(),
-            "-ar".into(),
-            "48000".into(),
-            "-ac".into(),
-            "2".into(),
-        ]);
+        args.extend(["-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into()]);
     } else {
         // A silent track keeps a join working when some clips have audio and some do not.
         args.extend([
@@ -388,22 +460,28 @@ fn compatible_args(
             "0:v:0".into(),
             "-map".into(),
             "1:a:0".into(),
-            "-vf".into(),
-            filter,
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            "veryfast".into(),
-            "-crf".into(),
-            "20".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "160k".into(),
-            "-shortest".into(),
         ]);
+    }
+
+    // Leave size, frame rate, and pixel format alone when they already match.
+    // A scale or fps filter resamples the picture even if the numbers look the same.
+    if let Some(filter) = video_filter(segment, target, hw) {
+        args.extend(["-vf".into(), filter]);
+    }
+
+    args.extend(video_encoder_args(segment, video_bitrate, hw));
+    args.extend([
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        audio_bitrate.to_string(),
+        "-ar".into(),
+        "48000".into(),
+        "-ac".into(),
+        "2".into(),
+    ]);
+    if !segment.has_audio {
+        args.push("-shortest".into());
     }
     args.extend([
         "-movflags".into(),
@@ -411,6 +489,259 @@ fn compatible_args(
         dest.display().to_string(),
     ]);
     args
+}
+
+/// Filters only when something about the picture must change to match `target`.
+fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<String> {
+    let mut parts = Vec::new();
+    let size_differs = segment.width != target.width || segment.height != target.height;
+    if size_differs {
+        let mut scale = format!(
+            "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos",
+            w = target.width,
+            h = target.height,
+        );
+        // Same range in and out, so a resize does not wash the color out or crush it.
+        if segment.color_range == "tv" || segment.color_range == "pc" {
+            let range = &segment.color_range;
+            scale.push_str(&format!(":in_range={range}:out_range={range}"));
+        }
+        parts.push(scale);
+        parts.push(format!(
+            "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+            w = target.width,
+            h = target.height,
+        ));
+        parts.push("setsar=1".into());
+    }
+    if (segment.fps - target.fps).abs() > 0.01 {
+        parts.push(format!("fps={}", format_fps(target.fps)));
+    }
+
+    let pix = output_pix_fmt(segment, hw);
+    if pix != segment.pix_fmt {
+        // yuvj* is full-range JPEG style. Convert the levels, don't just rename them.
+        if segment.pix_fmt.starts_with("yuvj")
+            && (segment.color_range == "pc" || segment.color_range.is_empty())
+        {
+            parts.push("scale=in_range=pc:out_range=pc".into());
+        }
+        parts.push(format!("format={pix}"));
+    }
+    if hw_needs_upload(hw) {
+        parts.push("format=nv12".into());
+        parts.push("hwupload".into());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
+fn video_encoder_args(segment: &Segment, bitrate: &str, hw: HwAccel) -> Vec<String> {
+    let mut args = Vec::new();
+    match hw {
+        HwAccel::Off => {
+            args.extend([
+                "-c:v".into(),
+                "libx264".into(),
+                // `medium` keeps more detail than `veryfast` at the same bitrate.
+                "-preset".into(),
+                "medium".into(),
+                "-b:v".into(),
+                bitrate.to_string(),
+                "-maxrate".into(),
+                bitrate.to_string(),
+                "-bufsize".into(),
+                doubled_bitrate(bitrate),
+            ]);
+        }
+        HwAccel::Nvidia => {
+            args.extend([
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p5".into(),
+                "-tune".into(),
+                "hq".into(),
+                "-rc".into(),
+                "vbr".into(),
+                "-b:v".into(),
+                bitrate.to_string(),
+                "-maxrate".into(),
+                bitrate.to_string(),
+                "-bufsize".into(),
+                doubled_bitrate(bitrate),
+            ]);
+        }
+        HwAccel::Amd => args.extend(amd_encoder_args(bitrate)),
+        HwAccel::Intel => {
+            args.extend([
+                "-c:v".into(),
+                "h264_qsv".into(),
+                "-preset".into(),
+                "medium".into(),
+                "-b:v".into(),
+                bitrate.to_string(),
+                "-maxrate".into(),
+                bitrate.to_string(),
+                "-bufsize".into(),
+                doubled_bitrate(bitrate),
+            ]);
+        }
+    }
+    let pix = output_pix_fmt(segment, hw);
+    if !hw_needs_upload(hw) {
+        args.extend(["-pix_fmt".into(), pix]);
+    }
+    args.extend(color_args(segment));
+    args
+}
+
+fn amd_encoder_args(bitrate: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            "-c:v".into(),
+            "h264_amf".into(),
+            "-quality".into(),
+            "quality".into(),
+            "-rc".into(),
+            "vbr_peak".into(),
+            "-b:v".into(),
+            bitrate.to_string(),
+            "-maxrate".into(),
+            bitrate.to_string(),
+        ]
+    } else if cfg!(target_os = "macos") {
+        // Macs have no AMF encoder. VideoToolbox is the hardware encoder there.
+        vec![
+            "-c:v".into(),
+            "h264_videotoolbox".into(),
+            "-b:v".into(),
+            bitrate.to_string(),
+            "-profile:v".into(),
+            "high".into(),
+        ]
+    } else {
+        vec![
+            "-c:v".into(),
+            "h264_vaapi".into(),
+            "-b:v".into(),
+            bitrate.to_string(),
+            "-maxrate".into(),
+            bitrate.to_string(),
+        ]
+    }
+}
+
+/// Decode flags placed before `-i`. Empty when hardware decode is off.
+fn hw_decode_args(hw: HwAccel) -> Vec<String> {
+    match hw {
+        HwAccel::Off => Vec::new(),
+        HwAccel::Nvidia => vec!["-hwaccel".into(), "nvdec".into()],
+        HwAccel::Intel => vec!["-hwaccel".into(), "qsv".into()],
+        HwAccel::Amd if cfg!(windows) => vec!["-hwaccel".into(), "d3d11va".into()],
+        HwAccel::Amd if cfg!(target_os = "macos") => {
+            vec!["-hwaccel".into(), "videotoolbox".into()]
+        }
+        HwAccel::Amd => vec![
+            "-hwaccel".into(),
+            "vaapi".into(),
+            "-vaapi_device".into(),
+            vaapi_device(),
+        ],
+    }
+}
+
+fn hw_needs_upload(hw: HwAccel) -> bool {
+    // VAAPI encode wants the frame uploaded. The other encoders accept CPU frames.
+    hw == HwAccel::Amd && !(cfg!(windows) || cfg!(target_os = "macos"))
+}
+
+fn vaapi_device() -> String {
+    match std::env::var("VAAPI_DEVICE") {
+        Ok(path) if !path.trim().is_empty() => path,
+        _ => "/dev/dri/renderD128".to_string(),
+    }
+}
+
+/// Pixel format written to the file. Hardware H.264 encoders stay on `yuv420p`.
+/// libx264 keeps the source format when that format is already a normal yuv one.
+fn output_pix_fmt(segment: &Segment, hw: HwAccel) -> String {
+    if hw != HwAccel::Off {
+        return "yuv420p".to_string();
+    }
+    match segment.pix_fmt.as_str() {
+        "yuv420p" | "yuv422p" | "yuv444p" | "yuv420p10le" | "yuv422p10le" | "yuv444p10le" => {
+            segment.pix_fmt.clone()
+        }
+        "yuvj420p" | "yuvj422p" | "yuvj444p" => "yuv420p".to_string(),
+        _ => "yuv420p".to_string(),
+    }
+}
+
+fn color_args(segment: &Segment) -> Vec<String> {
+    let mut args = Vec::new();
+    if segment.color_range == "tv" || segment.color_range == "pc" {
+        args.extend(["-color_range".into(), segment.color_range.clone()]);
+    }
+    if !segment.color_space.is_empty() {
+        args.extend(["-colorspace".into(), segment.color_space.clone()]);
+    }
+    if !segment.color_primaries.is_empty() {
+        args.extend(["-color_primaries".into(), segment.color_primaries.clone()]);
+    }
+    if !segment.color_transfer.is_empty() {
+        args.extend(["-color_trc".into(), segment.color_transfer.clone()]);
+    }
+    args
+}
+
+/// `8000k` → `16000k`, `8M` → `16M`. Used as the encoder buffer.
+fn doubled_bitrate(bitrate: &str) -> String {
+    let text = bitrate.trim();
+    let (number, suffix) = if let Some(rest) = text.strip_suffix(['k', 'K', 'm', 'M']) {
+        (rest, &text[text.len() - 1..])
+    } else {
+        (text, "k")
+    };
+    match number.parse::<f64>() {
+        Ok(value) if value > 0.0 => {
+            let doubled = value * 2.0;
+            if doubled.fract() == 0.0 {
+                format!("{}{suffix}", doubled as u64)
+            } else {
+                format!("{doubled}{suffix}")
+            }
+        }
+        _ => bitrate.to_string(),
+    }
+}
+
+/// Accept `8000k`, `8M`, or a plain number of kilobits (`192` → `192k`).
+///
+/// `M` stays uppercase. ffmpeg treats `m` as milli, which is not a useful bitrate.
+pub fn normalize_bitrate(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("enter a bitrate, for example 8000k.".into());
+    }
+    let (number, suffix) = match text.as_bytes().last().map(|c| c.to_ascii_lowercase()) {
+        Some(b'k') => (&text[..text.len() - 1], "k"),
+        Some(b'm') => (&text[..text.len() - 1], "M"),
+        _ => (text, "k"),
+    };
+    match number.parse::<f64>() {
+        Ok(value) if value.is_finite() && value > 0.0 => {
+            if value.fract() == 0.0 {
+                Ok(format!("{}{suffix}", value as u64))
+            } else {
+                Ok(format!("{value}{suffix}"))
+            }
+        }
+        _ => Err(format!("'{text}' is not a bitrate. Use 8000k or 8M.")),
+    }
 }
 
 struct Target {
@@ -626,7 +957,8 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("videocliptrimmer-{}-{millis}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("videocliptrimmer-{}-{millis}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|err| {
             ExportError::Message(format!("Could not create a temp folder: {err}"))
         })?;
@@ -660,8 +992,15 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
     let mut width = 0u32;
     let mut height = 0u32;
     let mut fps = 0.0;
+    let mut pix_fmt = String::new();
+    let mut color_range = String::new();
+    let mut color_space = String::new();
+    let mut color_primaries = String::new();
+    let mut color_transfer = String::new();
+    let mut video_bitrate = None;
     let mut has_audio = false;
     let mut audio_codec = String::new();
+    let mut audio_bitrate = None;
 
     for line in text.lines() {
         if line.contains("Video:") && !line.contains("attached pic") && width == 0 {
@@ -673,10 +1012,19 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
             if let Some(value) = find_fps(line) {
                 fps = value;
             }
+            if let Some(parsed) = parse_pix_fmt(line) {
+                pix_fmt = parsed.pix_fmt;
+                color_range = parsed.range;
+                color_space = parsed.space;
+                color_primaries = parsed.primaries;
+                color_transfer = parsed.transfer;
+            }
+            video_bitrate = first_bitrate_bps(line);
         }
         if line.contains("Audio:") && !has_audio {
             has_audio = true;
             audio_codec = codec_name(line, "Audio:");
+            audio_bitrate = first_bitrate_bps(line);
         }
     }
 
@@ -705,6 +1053,13 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
         has_audio,
         video_codec,
         audio_codec,
+        pix_fmt,
+        color_range,
+        color_space,
+        color_primaries,
+        color_transfer,
+        video_bitrate,
+        audio_bitrate,
     })
 }
 
@@ -765,6 +1120,108 @@ fn find_fps(line: &str) -> Option<f64> {
     None
 }
 
+struct PixFmt {
+    pix_fmt: String,
+    range: String,
+    space: String,
+    primaries: String,
+    transfer: String,
+}
+
+/// `yuv420p(tv, bt709)` → pixel format plus the color tags written in that parenthesis.
+fn parse_pix_fmt(line: &str) -> Option<PixFmt> {
+    let token = pix_fmt_token(line)?;
+    let name = token.split('(').next().unwrap_or(token).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut range = String::new();
+    let mut space = String::new();
+    if let Some(inside) = token
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split(')').next())
+    {
+        for item in inside.split(',') {
+            let item = item.trim();
+            match item {
+                "tv" | "mpeg" | "limited" => range = "tv".to_string(),
+                "pc" | "jpeg" | "full" => range = "pc".to_string(),
+                "progressive" | "top" | "bottom" | "unknown" | "" => {}
+                other => {
+                    if space.is_empty() {
+                        space = other.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // yuvj420p is full-range JPEG. Keep that so a later convert does not shift levels.
+    if name.starts_with("yuvj") && range.is_empty() {
+        range = "pc".to_string();
+    }
+    let (primaries, transfer, space) = match space.as_str() {
+        "bt709" => ("bt709".into(), "bt709".into(), "bt709".into()),
+        "bt470bg" => ("bt470bg".into(), "bt470bg".into(), "bt470bg".into()),
+        "smpte170m" => ("smpte170m".into(), "smpte170m".into(), "smpte170m".into()),
+        "bt2020" | "bt2020nc" => ("bt2020".into(), String::new(), "bt2020nc".into()),
+        "" => (String::new(), String::new(), String::new()),
+        other => (String::new(), String::new(), other.to_string()),
+    };
+    Some(PixFmt {
+        pix_fmt: name.to_string(),
+        range,
+        space,
+        primaries,
+        transfer,
+    })
+}
+
+fn pix_fmt_token(line: &str) -> Option<&str> {
+    let start = ["yuv", "nv12", "nv21", "p010le", "gbr", "rgb", "gray"]
+        .iter()
+        .filter_map(|marker| line.find(marker))
+        .min()?;
+    let rest = &line[start..];
+    let mut depth = 0i32;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    return Some(&rest[..=index]);
+                }
+            }
+            ',' if depth == 0 => return Some(rest[..index].trim()),
+            _ => {}
+        }
+    }
+    let end = rest
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn first_bitrate_bps(line: &str) -> Option<u64> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    for pair in parts.windows(2) {
+        let unit = pair[1].trim_matches(|c| c == ',' || c == ')');
+        let number = pair[0].trim_matches(|c| c == ',' || c == '(');
+        let factor = match unit {
+            "kb/s" => 1_000.0,
+            "mb/s" => 1_000_000.0,
+            _ => continue,
+        };
+        let value: f64 = number.parse().ok()?;
+        if value > 0.0 {
+            return Some((value * factor).round() as u64);
+        }
+    }
+    None
+}
+
 fn find_rotation(text: &str) -> Option<f64> {
     for line in text.lines() {
         if let Some(rest) = line.split("rotation of ").nth(1) {
@@ -781,11 +1238,24 @@ fn find_rotation(text: &str) -> Option<f64> {
 }
 
 /// Used by the UI thread. The grab itself runs on a worker so the window stays live.
-pub fn spawn_grab(path: PathBuf, time: f64, seq: u64) -> mpsc::Receiver<Grabbed> {
+pub fn spawn_grab(path: PathBuf, time: f64, seq: u64, hw: HwAccel) -> mpsc::Receiver<Grabbed> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = grab_frame(&path, time);
-        let _ = tx.send(Grabbed { seq, time, result });
+        let grabbed = match grab_frame(&path, time, hw) {
+            Ok(outcome) => Grabbed {
+                seq,
+                time,
+                result: Ok(outcome.frame),
+                warning: outcome.warning,
+            },
+            Err(err) => Grabbed {
+                seq,
+                time,
+                result: Err(err),
+                warning: None,
+            },
+        };
+        let _ = tx.send(grabbed);
     });
     rx
 }
@@ -794,6 +1264,7 @@ pub struct Grabbed {
     pub seq: u64,
     pub time: f64,
     pub result: Result<RgbaFrame, String>,
+    pub warning: Option<String>,
 }
 
 #[cfg(test)]
@@ -819,6 +1290,28 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(info.has_audio);
         assert_eq!(info.video_codec, "h264");
         assert_eq!(info.audio_codec, "aac");
+        assert_eq!(info.pix_fmt, "yuv420p");
+        assert_eq!(info.video_bitrate, Some(63_000));
+        assert_eq!(info.audio_bitrate, Some(69_000));
+    }
+
+    #[test]
+    fn reads_color_tags_from_the_pixel_format() {
+        let line = "Stream #0:0: Video: h264, yuv420p(tv, bt709), 1280x720, 4500 kb/s, 30 fps";
+        let parsed = parse_pix_fmt(line).unwrap();
+        assert_eq!(parsed.pix_fmt, "yuv420p");
+        assert_eq!(parsed.range, "tv");
+        assert_eq!(parsed.space, "bt709");
+        assert_eq!(parsed.primaries, "bt709");
+        assert_eq!(parsed.transfer, "bt709");
+        assert_eq!(first_bitrate_bps(line), Some(4_500_000));
+    }
+
+    #[test]
+    fn yuvj_is_full_range() {
+        let parsed = parse_pix_fmt("Video: mjpeg, yuvj420p, 640x360, 30 fps").unwrap();
+        assert_eq!(parsed.pix_fmt, "yuvj420p");
+        assert_eq!(parsed.range, "pc");
     }
 
     #[test]
@@ -837,11 +1330,60 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             height: 80,
             fps: 30.0,
             has_audio: true,
+            pix_fmt: "yuv420p".into(),
+            color_range: "tv".into(),
+            color_space: "bt709".into(),
+            color_primaries: "bt709".into(),
+            color_transfer: "bt709".into(),
         };
         let args = fast_copy_args(&segment, Path::new("out.mp4"), Path::new("p.txt"));
         assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
         assert!(args.iter().any(|a| a == "-avoid_negative_ts"));
         assert!(args.iter().any(|a| a == "1.500"));
+    }
+
+    #[test]
+    fn same_picture_is_not_scaled_or_recolored() {
+        let segment = Segment {
+            path: PathBuf::from("clip.mp4"),
+            start: 0.0,
+            end: 1.0,
+            width: 1920,
+            height: 1080,
+            fps: 25.0,
+            has_audio: true,
+            pix_fmt: "yuv420p".into(),
+            color_range: "tv".into(),
+            color_space: "bt709".into(),
+            color_primaries: "bt709".into(),
+            color_transfer: "bt709".into(),
+        };
+        let target = output_target(&segment);
+        assert!(video_filter(&segment, &target, HwAccel::Off).is_none());
+        let args = compatible_args(
+            &segment,
+            Path::new("out.mp4"),
+            &target,
+            Path::new("p.txt"),
+            "4500k",
+            "192k",
+            HwAccel::Off,
+        );
+        assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-crf"));
+        assert!(args.windows(2).any(|pair| pair == ["-b:v", "4500k"]));
+        assert!(args.windows(2).any(|pair| pair == ["-b:a", "192k"]));
+        assert!(args.windows(2).any(|pair| pair == ["-color_range", "tv"]));
+        assert!(args.windows(2).any(|pair| pair == ["-colorspace", "bt709"]));
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+    }
+
+    #[test]
+    fn nvidia_decode_is_requested_when_that_encoder_is_on() {
+        let args = hw_decode_args(HwAccel::Nvidia);
+        assert_eq!(args, ["-hwaccel", "nvdec"]);
+        assert_eq!(normalize_bitrate("8M").unwrap(), "8M");
+        assert_eq!(normalize_bitrate("192").unwrap(), "192k");
+        assert!(normalize_bitrate("nope").is_err());
     }
 
     #[test]
@@ -860,7 +1402,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         if !ffmpeg_ready() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("videocliptrimmer-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("videocliptrimmer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.mp4");
@@ -898,22 +1441,14 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert_eq!((info.width, info.height), (160, 120));
         assert!(info.has_audio);
 
-        let frame = grab_frame(&src, 0.4).unwrap();
+        let frame = grab_frame(&src, 0.4, HwAccel::Off).unwrap().frame;
         assert!(frame.width > 0 && frame.height > 0);
         assert_eq!(
             frame.pixels.len(),
             frame.width as usize * frame.height as usize * 4
         );
 
-        let segment = |start: f64, end: f64| Segment {
-            path: src.clone(),
-            start,
-            end,
-            width: info.width,
-            height: info.height,
-            fps: info.fps,
-            has_audio: info.has_audio,
-        };
+        let segment = |start: f64, end: f64| info.segment(src.clone(), start, end);
         let dest = dir.join("joined.mp4");
         let cancel = AtomicBool::new(false);
         let hooks = Hooks {
@@ -921,10 +1456,16 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             log: &|_| {},
             cancel: &cancel,
         };
+        let settings = EncodeSettings {
+            video_bitrate: "8000k".into(),
+            audio_bitrate: "160k".into(),
+            hw: HwAccel::Off,
+        };
         export(
             &[segment(0.0, 0.5), segment(1.0, 1.5)],
             &dest,
             EncodeMode::Compatible,
+            &settings,
             &hooks,
         )
         .unwrap();
