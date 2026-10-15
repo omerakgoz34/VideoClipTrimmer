@@ -1,0 +1,28 @@
+[package]
+name = "videocliptrimmer"
+version = "0.1.0"
+edition = "2021"
+description = "Cut and merge video clips. A small native desktop app that drives ffmpeg."
+license = "MIT"
+
+[[bin]]
+name = "videocliptrimmer"
+path = "src/main.rs"
+
+[dependencies]
+# egui 0.31 is what egui-miniquad 0.16 speaks. Immediate-mode UI, same on
+# Windows, macOS, and Linux, and small enough to read in an afternoon.
+egui = "0.31"
+egui-miniquad = "0.16"
+# miniquad opens a real OS window and draws with OpenGL. It does not use a
+# browser or a webview.
+miniquad = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Native save/open dialogs: Win32, Cocoa, and the Linux desktop portal.
+# GTK is intentionally off so Linux builds do not need libgtk headers.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+opt-level = 3
