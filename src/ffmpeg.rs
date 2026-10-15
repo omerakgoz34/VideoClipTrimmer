@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::timeutil::parse_time;
 
@@ -34,12 +34,13 @@ pub enum HwAccel {
     Intel,
 }
 
-/// Bitrates used when `EncodeMode::Compatible` re-encodes.
+/// Quality and audio rate used when `EncodeMode::Compatible` re-encodes.
 ///
-/// Strings are ffmpeg rates such as `8000k` or `192k`.
+/// `video_crf` is 0–51, same scale as x264. Lower keeps more of the picture.
+/// `audio_bitrate` is an ffmpeg rate such as `192k`.
 #[derive(Clone, Debug)]
 pub struct EncodeSettings {
-    pub video_bitrate: String,
+    pub video_crf: i32,
     pub audio_bitrate: String,
     pub hw: HwAccel,
 }
@@ -354,8 +355,7 @@ fn encode_segment(
     let args = match mode {
         EncodeMode::FastCopy => fast_copy_args(segment, dest, &progress_path),
         EncodeMode::Compatible => {
-            let video_bitrate = normalize_bitrate(&settings.video_bitrate)
-                .map_err(|err| ExportError::Message(format!("Video bitrate: {err}")))?;
+            let crf = settings.video_crf.clamp(0, 51);
             let audio_bitrate = normalize_bitrate(&settings.audio_bitrate)
                 .map_err(|err| ExportError::Message(format!("Audio bitrate: {err}")))?;
             let target = target.unwrap_or_else(|| output_target(segment));
@@ -364,7 +364,7 @@ fn encode_segment(
                 dest,
                 &target,
                 &progress_path,
-                &video_bitrate,
+                crf,
                 &audio_bitrate,
                 settings.hw,
             )
@@ -417,7 +417,7 @@ fn compatible_args(
     dest: &Path,
     target: &Target,
     progress: &Path,
-    video_bitrate: &str,
+    video_crf: i32,
     audio_bitrate: &str,
     hw: HwAccel,
 ) -> Vec<String> {
@@ -469,7 +469,7 @@ fn compatible_args(
         args.extend(["-vf".into(), filter]);
     }
 
-    args.extend(video_encoder_args(segment, video_bitrate, hw));
+    args.extend(video_encoder_args(segment, video_crf, hw));
     args.extend([
         "-c:a".into(),
         "aac".into(),
@@ -539,25 +539,23 @@ fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<Strin
     }
 }
 
-fn video_encoder_args(segment: &Segment, bitrate: &str, hw: HwAccel) -> Vec<String> {
+fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
+    let quality = crf.clamp(0, 51).to_string();
     let mut args = Vec::new();
     match hw {
         HwAccel::Off => {
             args.extend([
                 "-c:v".into(),
                 "libx264".into(),
-                // `medium` keeps more detail than `veryfast` at the same bitrate.
+                // `medium` keeps more detail than `veryfast` at the same CRF.
                 "-preset".into(),
                 "medium".into(),
-                "-b:v".into(),
-                bitrate.to_string(),
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                doubled_bitrate(bitrate),
+                "-crf".into(),
+                quality,
             ]);
         }
         HwAccel::Nvidia => {
+            // NVENC's `-cq` uses the same 0–51 scale as x264 CRF.
             args.extend([
                 "-c:v".into(),
                 "h264_nvenc".into(),
@@ -567,27 +565,20 @@ fn video_encoder_args(segment: &Segment, bitrate: &str, hw: HwAccel) -> Vec<Stri
                 "hq".into(),
                 "-rc".into(),
                 "vbr".into(),
-                "-b:v".into(),
-                bitrate.to_string(),
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                doubled_bitrate(bitrate),
+                "-cq".into(),
+                quality,
             ]);
         }
-        HwAccel::Amd => args.extend(amd_encoder_args(bitrate)),
+        HwAccel::Amd => args.extend(amd_encoder_args(&quality)),
         HwAccel::Intel => {
+            // `global_quality` is Intel's CRF-style control. Lower keeps more detail.
             args.extend([
                 "-c:v".into(),
                 "h264_qsv".into(),
                 "-preset".into(),
                 "medium".into(),
-                "-b:v".into(),
-                bitrate.to_string(),
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                doubled_bitrate(bitrate),
+                "-global_quality".into(),
+                quality,
             ]);
         }
     }
@@ -599,7 +590,7 @@ fn video_encoder_args(segment: &Segment, bitrate: &str, hw: HwAccel) -> Vec<Stri
     args
 }
 
-fn amd_encoder_args(bitrate: &str) -> Vec<String> {
+fn amd_encoder_args(crf: &str) -> Vec<String> {
     if cfg!(windows) {
         vec![
             "-c:v".into(),
@@ -607,19 +598,23 @@ fn amd_encoder_args(bitrate: &str) -> Vec<String> {
             "-quality".into(),
             "quality".into(),
             "-rc".into(),
-            "vbr_peak".into(),
-            "-b:v".into(),
-            bitrate.to_string(),
-            "-maxrate".into(),
-            bitrate.to_string(),
+            "cqp".into(),
+            "-qp_i".into(),
+            crf.to_string(),
+            "-qp_p".into(),
+            crf.to_string(),
+            "-qp_b".into(),
+            crf.to_string(),
         ]
     } else if cfg!(target_os = "macos") {
         // Macs have no AMF encoder. VideoToolbox is the hardware encoder there.
+        // Its quality is 1–100 and higher is better, the opposite of CRF.
+        let value: i32 = crf.parse().unwrap_or(18);
         vec![
             "-c:v".into(),
             "h264_videotoolbox".into(),
-            "-b:v".into(),
-            bitrate.to_string(),
+            "-q:v".into(),
+            videotoolbox_quality(value).to_string(),
             "-profile:v".into(),
             "high".into(),
         ]
@@ -627,12 +622,18 @@ fn amd_encoder_args(bitrate: &str) -> Vec<String> {
         vec![
             "-c:v".into(),
             "h264_vaapi".into(),
-            "-b:v".into(),
-            bitrate.to_string(),
-            "-maxrate".into(),
-            bitrate.to_string(),
+            "-rc_mode".into(),
+            "CQP".into(),
+            "-qp".into(),
+            crf.to_string(),
         ]
     }
+}
+
+/// VideoToolbox quality 1–100 from a CRF value. CRF 0 → 100, CRF 51 → 1.
+fn videotoolbox_quality(crf: i32) -> i32 {
+    let crf = crf.clamp(0, 51);
+    (((51 - crf) * 100) / 51).clamp(1, 100)
 }
 
 /// Decode flags placed before `-i`. Empty when hardware decode is off.
@@ -663,6 +664,124 @@ fn vaapi_device() -> String {
     match std::env::var("VAAPI_DEVICE") {
         Ok(path) if !path.trim().is_empty() => path,
         _ => "/dev/dri/renderD128".to_string(),
+    }
+}
+
+pub fn hw_name(hw: HwAccel) -> &'static str {
+    match hw {
+        HwAccel::Off => "off",
+        HwAccel::Nvidia => "nvidia",
+        HwAccel::Amd => "amd",
+        HwAccel::Intel => "intel",
+    }
+}
+
+pub fn parse_hw_name(text: &str) -> Option<HwAccel> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(HwAccel::Off),
+        "nvidia" => Some(HwAccel::Nvidia),
+        "amd" => Some(HwAccel::Amd),
+        "intel" => Some(HwAccel::Intel),
+        _ => None,
+    }
+}
+
+/// First hardware pair that can both encode and decode here.
+/// Tries NVIDIA, then AMD, then Intel. `Off` when none of them work.
+pub fn detect_hw() -> HwAccel {
+    for hw in [HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
+        if hw_pair_works(hw) {
+            return hw;
+        }
+    }
+    HwAccel::Off
+}
+
+pub fn spawn_hw_detect() -> mpsc::Receiver<HwAccel> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(detect_hw());
+    });
+    rx
+}
+
+fn hw_pair_works(hw: HwAccel) -> bool {
+    let dir = std::env::temp_dir().join(format!(
+        "videocliptrimmer-hw-{}-{}",
+        std::process::id(),
+        hw_name(hw)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let sample = dir.join("sample.mp4");
+    let ok = encoder_accepts(hw, &sample) && decoder_accepts(hw, &sample);
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
+}
+
+fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
+    let mut cmd = Command::new(ffmpeg_program());
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    if hw_needs_upload(hw) {
+        cmd.arg("-vaapi_device").arg(vaapi_device());
+    }
+    cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.08"]);
+    if hw_needs_upload(hw) {
+        cmd.args(["-vf", "format=nv12,hwupload"]);
+    }
+    cmd.args(video_encoder_args(&probe_segment(), 23, hw));
+    cmd.arg(dest);
+    command_ok(cmd, Duration::from_secs(5)) && dest.is_file()
+}
+
+fn decoder_accepts(hw: HwAccel, src: &Path) -> bool {
+    let mut cmd = Command::new(ffmpeg_program());
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    cmd.args(hw_decode_args(hw));
+    cmd.arg("-i").arg(src);
+    cmd.args(["-frames:v", "1", "-f", "null", "-"]);
+    command_ok(cmd, Duration::from_secs(5))
+}
+
+fn probe_segment() -> Segment {
+    Segment {
+        path: PathBuf::new(),
+        start: 0.0,
+        end: 0.1,
+        width: 64,
+        height: 64,
+        fps: 25.0,
+        has_audio: false,
+        pix_fmt: "yuv420p".into(),
+        color_range: String::new(),
+        color_space: String::new(),
+        color_primaries: String::new(),
+        color_transfer: String::new(),
+    }
+}
+
+fn command_ok(mut cmd: Command, timeout: Duration) -> bool {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(40)),
+            Err(_) => return false,
+        }
     }
 }
 
@@ -698,28 +817,7 @@ fn color_args(segment: &Segment) -> Vec<String> {
     args
 }
 
-/// `8000k` → `16000k`, `8M` → `16M`. Used as the encoder buffer.
-fn doubled_bitrate(bitrate: &str) -> String {
-    let text = bitrate.trim();
-    let (number, suffix) = if let Some(rest) = text.strip_suffix(['k', 'K', 'm', 'M']) {
-        (rest, &text[text.len() - 1..])
-    } else {
-        (text, "k")
-    };
-    match number.parse::<f64>() {
-        Ok(value) if value > 0.0 => {
-            let doubled = value * 2.0;
-            if doubled.fract() == 0.0 {
-                format!("{}{suffix}", doubled as u64)
-            } else {
-                format!("{doubled}{suffix}")
-            }
-        }
-        _ => bitrate.to_string(),
-    }
-}
-
-/// Accept `8000k`, `8M`, or a plain number of kilobits (`192` → `192k`).
+/// `8000k` or `8M`, or a plain number of kilobits (`192` → `192k`).
 ///
 /// `M` stays uppercase. ffmpeg treats `m` as milli, which is not a useful bitrate.
 pub fn normalize_bitrate(text: &str) -> Result<String, String> {
@@ -1365,16 +1463,29 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             Path::new("out.mp4"),
             &target,
             Path::new("p.txt"),
-            "4500k",
+            18,
             "192k",
             HwAccel::Off,
         );
-        assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-crf"));
-        assert!(args.windows(2).any(|pair| pair == ["-b:v", "4500k"]));
+        assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-b:v"));
+        assert!(args.windows(2).any(|pair| pair == ["-crf", "18"]));
         assert!(args.windows(2).any(|pair| pair == ["-b:a", "192k"]));
         assert!(args.windows(2).any(|pair| pair == ["-color_range", "tv"]));
         assert!(args.windows(2).any(|pair| pair == ["-colorspace", "bt709"]));
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+
+        let nvidia = video_encoder_args(&segment, 18, HwAccel::Nvidia);
+        assert!(nvidia.windows(2).any(|pair| pair == ["-cq", "18"]));
+        assert!(!nvidia.iter().any(|arg| arg == "-b:v"));
+        let intel = video_encoder_args(&segment, 18, HwAccel::Intel);
+        assert!(intel
+            .windows(2)
+            .any(|pair| pair == ["-global_quality", "18"]));
+        assert_eq!(videotoolbox_quality(0), 100);
+        assert_eq!(videotoolbox_quality(18), 64);
+        assert_eq!(videotoolbox_quality(51), 1);
+        assert_eq!(parse_hw_name("NVIDIA"), Some(HwAccel::Nvidia));
+        assert_eq!(hw_name(HwAccel::Intel), "intel");
     }
 
     #[test]
@@ -1457,7 +1568,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             cancel: &cancel,
         };
         let settings = EncodeSettings {
-            video_bitrate: "8000k".into(),
+            video_crf: 18,
             audio_bitrate: "160k".into(),
             hw: HwAccel::Off,
         };

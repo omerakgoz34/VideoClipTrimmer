@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Instant;
 
 use crate::ffmpeg::{
-    self, check_ffmpeg, export, spawn_grab, EncodeMode, EncodeSettings, ExportError, Grabbed,
-    Hooks, HwAccel, MediaInfo, Segment,
+    self, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab, spawn_hw_detect, EncodeMode,
+    EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, Segment,
 };
 use crate::timeutil::{format_time, parse_time};
 
@@ -34,10 +34,12 @@ pub struct App {
     clips: Vec<Clip>,
     selected: Option<usize>,
     mode: EncodeMode,
-    video_bitrate: String,
+    video_crf: i32,
     audio_bitrate: String,
-    bitrate_edited: bool,
+    audio_bitrate_edited: bool,
     hw: HwAccel,
+    hw_touched: bool,
+    hw_detect: Option<Receiver<HwAccel>>,
     hw_warned: bool,
     path_text: String,
     notice: Notice,
@@ -86,8 +88,18 @@ enum Notice {
 
 impl App {
     pub fn new() -> Self {
+        let ffmpeg = check_ffmpeg();
+        let saved_hw = load_saved_hw();
+        let hw = saved_hw.unwrap_or(HwAccel::Off);
+        // A saved choice means this is not the first launch. Don't probe again.
+        let hw_touched = saved_hw.is_some();
+        let hw_detect = if !hw_touched && ffmpeg.is_ok() {
+            Some(spawn_hw_detect())
+        } else {
+            None
+        };
         Self {
-            ffmpeg: check_ffmpeg(),
+            ffmpeg,
             media: None,
             playhead: 0.0,
             in_point: 0.0,
@@ -102,10 +114,12 @@ impl App {
             clips: Vec::new(),
             selected: None,
             mode: EncodeMode::Compatible,
-            video_bitrate: "8000k".to_string(),
+            video_crf: 18,
             audio_bitrate: "192k".to_string(),
-            bitrate_edited: false,
-            hw: HwAccel::Off,
+            audio_bitrate_edited: false,
+            hw,
+            hw_touched,
+            hw_detect,
             hw_warned: false,
             path_text: String::new(),
             notice: Notice::None,
@@ -122,7 +136,11 @@ impl App {
     }
 
     pub fn wants_redraw(&self) -> bool {
-        self.playing || self.grab.is_some() || self.job.is_some() || self.wanted_time.is_some()
+        self.playing
+            || self.grab.is_some()
+            || self.job.is_some()
+            || self.wanted_time.is_some()
+            || self.hw_detect.is_some()
     }
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>) {
@@ -161,6 +179,7 @@ impl App {
     pub fn ui(&mut self, ctx: &egui::Context) {
         self.ensure_theme(ctx);
         self.tick();
+        self.poll_hw_detect();
         self.pump_preview(ctx);
         self.poll_job();
         self.sync_time_fields();
@@ -428,22 +447,22 @@ impl App {
         });
         if self.mode == EncodeMode::Compatible {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Video bitrate");
-                let video = ui.add(
-                    egui::TextEdit::singleline(&mut self.video_bitrate)
-                        .desired_width(88.0)
-                        .hint_text("8000k"),
-                );
+                ui.label("Video quality");
+                ui.spacing_mut().slider_width = 150.0;
+                ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
+                ui.label(muted("lower keeps more detail"));
+            });
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Audio bitrate");
                 let audio = ui.add(
                     egui::TextEdit::singleline(&mut self.audio_bitrate)
                         .desired_width(72.0)
                         .hint_text("192k"),
                 );
-                if video.changed() || audio.changed() {
-                    self.bitrate_edited = true;
+                if audio.changed() {
+                    self.audio_bitrate_edited = true;
                 }
-                ui.label(muted("8000k or 8M"));
+                ui.label(muted("192k or 2M"));
             });
         }
         ui.horizontal_wrapped(|ui| {
@@ -451,18 +470,23 @@ impl App {
             let previous = self.hw;
             ui.radio_value(&mut self.hw, HwAccel::Off, "Off");
             ui.radio_value(&mut self.hw, HwAccel::Nvidia, "NVIDIA");
-            ui.radio_value(&mut self.hw, HwAccel::Amd, "AMD");
+            ui.radio_value(&mut self.hw, HwAccel::Amd, amd_button_label());
             ui.radio_value(&mut self.hw, HwAccel::Intel, "Intel");
             if self.hw != previous {
                 self.hw_warned = false;
+                self.hw_touched = true;
+                save_hw(self.hw);
                 if self.media.is_some() {
                     self.wanted_time = Some(self.playhead);
                 }
             }
+            if self.hw_detect.is_some() {
+                ui.label(muted("checking…"));
+            }
         });
         ui.label(muted(match self.mode {
             EncodeMode::Compatible => {
-                "Re-encodes at the bitrates above. Size, frame rate, and color tags stay as they are, unless clips must be matched to the first one. Hardware also decodes the preview."
+                "Re-encodes at the CRF above. Lower keeps more of the picture. Size, frame rate, and color tags stay as they are, unless clips must be matched to the first one. Hardware also decodes the preview."
             }
             EncodeMode::FastCopy => {
                 "No re-encode. A cut starts near the previous keyframe. Joins need matching files. Hardware still decodes the preview when it is on."
@@ -945,7 +969,7 @@ impl App {
         let job_dest = dest.clone();
         let mode = self.mode;
         let settings = EncodeSettings {
-            video_bitrate: self.video_bitrate.clone(),
+            video_crf: self.video_crf,
             audio_bitrate: self.audio_bitrate.clone(),
             hw: self.hw,
         };
@@ -1009,14 +1033,45 @@ impl App {
     }
 
     fn apply_source_bitrates(&mut self, info: &MediaInfo) {
-        if self.bitrate_edited {
+        if self.audio_bitrate_edited {
             return;
-        }
-        if let Some(bits) = info.video_bitrate {
-            self.video_bitrate = format_kbps(bits);
         }
         if let Some(bits) = info.audio_bitrate {
             self.audio_bitrate = format_kbps(bits);
+        }
+    }
+
+    fn poll_hw_detect(&mut self) {
+        let message = {
+            let Some(rx) = &self.hw_detect else {
+                return;
+            };
+            rx.try_recv()
+        };
+        match message {
+            Ok(hw) => {
+                self.hw_detect = None;
+                if self.hw_touched {
+                    return;
+                }
+                self.hw = hw;
+                self.hw_touched = true;
+                save_hw(hw);
+                if hw != HwAccel::Off {
+                    self.info(format!("Using {} hardware.", hw_label(hw)));
+                    if self.media.is_some() {
+                        self.wanted_time = Some(self.playhead);
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.hw_detect = None;
+                if !self.hw_touched {
+                    self.hw_touched = true;
+                    save_hw(HwAccel::Off);
+                }
+            }
         }
     }
 
@@ -1171,6 +1226,63 @@ fn ffmpeg_label(version: &str) -> String {
 fn format_kbps(bits_per_second: u64) -> String {
     let kbps = ((bits_per_second as f64) / 1000.0).round() as u64;
     format!("{kbps}k")
+}
+
+fn amd_button_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Apple"
+    } else {
+        "AMD"
+    }
+}
+
+fn hw_label(hw: HwAccel) -> &'static str {
+    match hw {
+        HwAccel::Off => "CPU",
+        HwAccel::Nvidia => "NVIDIA",
+        HwAccel::Amd => amd_button_label(),
+        HwAccel::Intel => "Intel",
+    }
+}
+
+/// Remembers the hardware choice so the next launch does not probe again.
+fn settings_path() -> Option<PathBuf> {
+    let dir = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library")
+            .join("Application Support")
+            .join("VideoClipTrimmer")
+    } else {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(path) if !path.is_empty() => PathBuf::from(path),
+            _ => home.join(".config"),
+        }
+        .join("videocliptrimmer")
+    };
+    Some(dir.join("settings.txt"))
+}
+
+fn load_saved_hw() -> Option<HwAccel> {
+    let text = std::fs::read_to_string(settings_path()?).ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("hw=") {
+            return parse_hw_name(value);
+        }
+    }
+    None
+}
+
+fn save_hw(hw: HwAccel) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("hw={}\n", hw_name(hw)));
 }
 
 fn file_label(path: &Path) -> String {
