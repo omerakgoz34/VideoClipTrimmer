@@ -717,7 +717,11 @@ fn compatible_args(
 }
 
 /// Filters only when something about the picture must change to match `target`.
+/// Windows Intel always returns a filter: the frames stay on the GPU.
 fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<String> {
+    if hw == HwAccel::Intel && cfg!(windows) {
+        return Some(intel_windows_filter(segment, target));
+    }
     let mut parts = Vec::new();
     let size_differs = segment.width != target.width || segment.height != target.height;
     if size_differs {
@@ -897,21 +901,15 @@ fn hw_decode_args(hw: HwAccel) -> Vec<String> {
 /// Decode plus the device the encoder uploads into. Export only.
 fn export_input_args(hw: HwAccel) -> Vec<String> {
     if hw == HwAccel::Intel && cfg!(windows) {
-        // One D3D11 device, then Quick Sync derived from it. A second QSV
-        // device (`-hwaccel qsv` plus `hwupload`) is what broke the frame pool.
+        // Keep the D3D11 textures and map them into Quick Sync.
+        // `hwupload` was failing here with "Could not create the texture (80070057)".
         return vec![
-            "-init_hw_device".into(),
-            "d3d11va=d3d".into(),
-            "-init_hw_device".into(),
-            "qsv=qs@d3d".into(),
-            "-filter_hw_device".into(),
-            "qs".into(),
             "-hwaccel".into(),
             "d3d11va".into(),
-            "-hwaccel_device".into(),
-            "d3d".into(),
             "-hwaccel_output_format".into(),
-            "nv12".into(),
+            "d3d11".into(),
+            "-extra_hw_frames".into(),
+            "64".into(),
         ];
     }
     if hw == HwAccel::Intel {
@@ -939,14 +937,8 @@ fn export_input_args(hw: HwAccel) -> Vec<String> {
 
 fn hw_device_init(hw: HwAccel) -> Vec<String> {
     match hw {
-        HwAccel::Intel if cfg!(windows) => vec![
-            "-init_hw_device".into(),
-            "d3d11va=d3d".into(),
-            "-init_hw_device".into(),
-            "qsv=qs@d3d".into(),
-            "-filter_hw_device".into(),
-            "qs".into(),
-        ],
+        // Windows Intel does not use this. Export maps D3D11 frames instead.
+        HwAccel::Intel if cfg!(windows) => Vec::new(),
         HwAccel::Intel => vec![
             "-init_hw_device".into(),
             "qsv=hw".into(),
@@ -965,6 +957,9 @@ fn uses_hw_upload(hw: HwAccel) -> bool {
 }
 
 fn upload_filter(hw: HwAccel) -> Option<&'static str> {
+    if hw == HwAccel::Intel && cfg!(windows) {
+        return None;
+    }
     if hw == HwAccel::Intel {
         // `format=qsv` stops ffmpeg inserting auto_scale in front of h264_qsv.
         return Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv");
@@ -973,6 +968,23 @@ fn upload_filter(hw: HwAccel) -> Option<&'static str> {
         return Some("format=nv12,hwupload");
     }
     None
+}
+
+/// Map D3D11 decode surfaces into Quick Sync. No `hwupload`, so ffmpeg does not
+/// have to allocate a new texture from system memory.
+fn intel_windows_filter(segment: &Segment, target: &Target) -> String {
+    let mut chain = String::from("hwmap=derive_device=qsv,format=qsv");
+    let size_differs = segment.width != target.width || segment.height != target.height;
+    let fps_differs = (segment.fps - target.fps).abs() > 0.01;
+    if size_differs || fps_differs {
+        let mut vpp = format!("vpp_qsv=w={}:h={}", target.width, target.height);
+        if fps_differs {
+            vpp.push_str(&format!(":framerate={}", format_fps(target.fps)));
+        }
+        chain.push(',');
+        chain.push_str(&vpp);
+    }
+    chain
 }
 
 fn hw_needs_upload(hw: HwAccel) -> bool {
@@ -1042,6 +1054,9 @@ fn hw_pair_works(hw: HwAccel) -> bool {
 }
 
 fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
+    if hw == HwAccel::Intel && cfg!(windows) {
+        return intel_windows_encoder_accepts(dest);
+    }
     let mut cmd = Command::new(ffmpeg_program());
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     cmd.args(hw_device_init(hw));
@@ -1052,6 +1067,44 @@ fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
     cmd.args(video_encoder_args(&probe_segment(), 23, hw));
     cmd.arg(dest);
     command_ok(cmd, Duration::from_secs(5)) && dest.is_file()
+}
+
+/// Lavfi frames are not D3D11 surfaces, so the Windows probe transcodes a tiny file.
+fn intel_windows_encoder_accepts(dest: &Path) -> bool {
+    let tiny = dest.with_extension("src.mp4");
+    let mut make = Command::new(ffmpeg_program());
+    make.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:r=25:d=0.08",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+    ])
+    .arg(&tiny);
+    if !command_ok(make, Duration::from_secs(5)) {
+        return false;
+    }
+    let segment = probe_segment();
+    let target = output_target(&segment);
+    let mut cmd = Command::new(ffmpeg_program());
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    cmd.args(export_input_args(HwAccel::Intel));
+    cmd.arg("-i").arg(&tiny);
+    if let Some(filter) = video_filter(&segment, &target, HwAccel::Intel) {
+        cmd.args(["-vf", &filter]);
+    }
+    cmd.args(video_encoder_args(&segment, 23, HwAccel::Intel));
+    cmd.arg(dest);
+    let ok = command_ok(cmd, Duration::from_secs(5)) && dest.is_file();
+    let _ = std::fs::remove_file(tiny);
+    ok
 }
 
 fn decoder_accepts(hw: HwAccel, src: &Path) -> bool {
