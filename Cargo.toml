@@ -6,7 +6,7 @@ description = "A simple yet useful program to trim and merge video clips."
 license = "MIT"
 
 [[bin]]
-name = "videocliptrimmer"
+name = "video-clip-trimmer"
 path = "src/main.rs"
 
 [dependencies]

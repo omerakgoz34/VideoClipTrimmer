@@ -456,7 +456,7 @@ impl App {
                 self.export_current();
             }
             ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Re-Encode");
-            ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast copy");
+            ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast-Copy");
         });
         if self.mode == EncodeMode::Compatible {
             ui.horizontal_wrapped(|ui| {
