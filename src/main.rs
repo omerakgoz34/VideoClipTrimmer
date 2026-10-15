@@ -4,6 +4,9 @@
 //! window, OpenGL, no browser). ffmpeg does the actual cutting and joining;
 //! see `ffmpeg.rs`.
 
+// Release builds are a GUI program. No console window, and no console output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ffmpeg;
 mod timeutil;
 mod ui;

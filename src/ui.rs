@@ -145,10 +145,20 @@ impl App {
             || self.hw_detect.is_some()
     }
 
-    /// Keeps the window from spinning at full speed while a frame is on the way.
+    /// How long to wait before the next frame. Idle windows wait on the OS instead.
     pub fn redraw_wait(&self) -> Duration {
-        if self.playing || self.grab.is_some() || self.job.is_some() || self.hw_detect.is_some() {
-            Duration::from_millis(12)
+        if self.playing {
+            let fps = self
+                .media
+                .as_ref()
+                .map(|media| media.info.fps)
+                .filter(|fps| fps.is_finite() && *fps > 1.0)
+                .unwrap_or(30.0)
+                .clamp(24.0, 60.0);
+            Duration::from_secs_f64(1.0 / fps)
+        } else if self.wants_redraw() {
+            // A job or a single frame is in flight. Polling faster than this just burns a core.
+            Duration::from_millis(16)
         } else {
             Duration::ZERO
         }
@@ -322,8 +332,7 @@ impl App {
             ui.label("Open a video, mark the part you want, and add it to the list.");
             ui.label("Export one range, or join the list into a single file.");
             ui.add_space(12.0);
-            if ui
-                .add(accent_button("Open videos…"))
+            if icon_button(ui, true, Icon::Folder, "Open videos…", true)
                 .on_hover_text("You can also drop files onto this window.")
                 .clicked()
             {
@@ -340,20 +349,18 @@ impl App {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            let play = if self.playing { "Pause" } else { "Play" };
-            if ui.add_enabled(has_media, egui::Button::new(play)).clicked() {
+            let (icon, play) = if self.playing {
+                (Icon::Pause, "Pause")
+            } else {
+                (Icon::Play, "Play")
+            };
+            if icon_button(ui, has_media, icon, play, false).clicked() {
                 self.toggle_play();
             }
-            if ui
-                .add_enabled(has_media, egui::Button::new("−1s"))
-                .clicked()
-            {
+            if icon_button(ui, has_media, Icon::Back, "−1s", false).clicked() {
                 self.nudge(-1.0);
             }
-            if ui
-                .add_enabled(has_media, egui::Button::new("+1s"))
-                .clicked()
-            {
+            if icon_button(ui, has_media, Icon::Forward, "+1s", false).clicked() {
                 self.nudge(1.0);
             }
             ui.label(format!(
@@ -390,15 +397,12 @@ impl App {
                 }
             }
             self.in_edit = in_edit.has_focus();
-            if ui
-                .add_enabled(has_media, egui::Button::new("Set"))
-                .clicked()
-            {
+            if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
                 self.in_point = self.playhead;
                 self.clamp_range();
                 self.write_time_fields();
             }
-            if ui.add_enabled(has_media, egui::Button::new("Go")).clicked() {
+            if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
                 self.seek(self.in_point);
             }
 
@@ -415,41 +419,39 @@ impl App {
                 }
             }
             self.out_edit = out_edit.has_focus();
-            if ui
-                .add_enabled(has_media, egui::Button::new("Set"))
-                .clicked()
-            {
+            if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
                 self.out_point = self.playhead;
                 self.clamp_range();
                 self.write_time_fields();
             }
-            if ui.add_enabled(has_media, egui::Button::new("Go")).clicked() {
+            if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
                 self.seek(self.out_point);
             }
         });
 
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(has_media, accent_button("Add to list"))
-                .clicked()
-            {
+            if icon_button(ui, has_media, Icon::Plus, "Add to list", true).clicked() {
                 self.add_current_range();
             }
-            if ui
-                .add_enabled(
-                    has_media && self.selected.is_some(),
-                    egui::Button::new("Update selected"),
-                )
-                .clicked()
+            if icon_button(
+                ui,
+                has_media && self.selected.is_some(),
+                Icon::Update,
+                "Update selected",
+                false,
+            )
+            .clicked()
             {
                 self.update_selected();
             }
-            if ui
-                .add_enabled(
-                    has_media && !busy && self.ffmpeg.is_ok(),
-                    accent_button("Export this range…"),
-                )
-                .clicked()
+            if icon_button(
+                ui,
+                has_media && !busy && self.ffmpeg.is_ok(),
+                Icon::Export,
+                "Export this range…",
+                true,
+            )
+            .clicked()
             {
                 self.export_current();
             }
@@ -598,35 +600,37 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let has = self.selected.is_some();
-            if ui.add_enabled(has, egui::Button::new("Up")).clicked() {
+            if icon_button(ui, has, Icon::Up, "Up", false).clicked() {
                 self.move_selected(-1);
             }
-            if ui.add_enabled(has, egui::Button::new("Down")).clicked() {
+            if icon_button(ui, has, Icon::Down, "Down", false).clicked() {
                 self.move_selected(1);
             }
-            if ui.add_enabled(has, egui::Button::new("Remove")).clicked() {
+            if icon_button(ui, has, Icon::Remove, "Remove", false).clicked() {
                 self.remove_selected();
             }
         });
         ui.horizontal(|ui| {
             if self.clips.is_empty() {
-                ui.add_enabled(false, egui::Button::new("Clear"));
+                icon_button(ui, false, Icon::Clear, "Clear", false);
             } else if self.clear_armed {
-                if ui.button("Click again to clear").clicked() {
+                if icon_button(ui, true, Icon::Clear, "Click again to clear", false).clicked() {
                     self.clips.clear();
                     self.selected = None;
                     self.clear_armed = false;
                 }
-            } else if ui.button("Clear").clicked() {
+            } else if icon_button(ui, true, Icon::Clear, "Clear", false).clicked() {
                 self.clear_armed = true;
             }
             let busy = self.job.is_some();
-            if ui
-                .add_enabled(
-                    !self.clips.is_empty() && !busy && self.ffmpeg.is_ok(),
-                    accent_button("Export list…"),
-                )
-                .clicked()
+            if icon_button(
+                ui,
+                !self.clips.is_empty() && !busy && self.ffmpeg.is_ok(),
+                Icon::Export,
+                "Export list…",
+                true,
+            )
+            .clicked()
             {
                 self.export_list();
             }
@@ -644,7 +648,7 @@ impl App {
                         .desired_width(ui.available_width() - 70.0)
                         .hint_text("/path/to/video.mp4"),
                 );
-                if ui.button("Load").clicked() {
+                if icon_button(ui, true, Icon::Folder, "Load", false).clicked() {
                     let path = PathBuf::from(self.path_text.trim());
                     if path.as_os_str().is_empty() {
                         return;
@@ -1279,8 +1283,246 @@ fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) {
         .image(tex.id(), image_rect, uv, egui::Color32::WHITE);
 }
 
-fn accent_button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(text).fill(rgb(0x3d, 0x6a, 0x74))
+#[derive(Clone, Copy)]
+enum Icon {
+    Play,
+    Pause,
+    Back,
+    Forward,
+    Mark,
+    Go,
+    Plus,
+    Update,
+    Export,
+    Up,
+    Down,
+    Remove,
+    Clear,
+    Folder,
+}
+
+struct IconButton<'a> {
+    icon: Icon,
+    label: &'a str,
+    accent: bool,
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: Icon,
+    label: &str,
+    accent: bool,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        IconButton {
+            icon,
+            label,
+            accent,
+        },
+    )
+}
+
+impl egui::Widget for IconButton<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let galley =
+            ui.painter()
+                .layout_no_wrap(self.label.to_owned(), font, egui::Color32::PLACEHOLDER);
+        let icon = 12.0;
+        let gap = 6.0;
+        let pad = ui.spacing().button_padding;
+        let height = galley.size().y.max(icon);
+        let size = egui::vec2(
+            pad.x * 2.0 + icon + gap + galley.size().x,
+            pad.y * 2.0 + height,
+        );
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact(&response);
+            let fill = if self.accent && ui.is_enabled() {
+                rgb(0x3d, 0x6a, 0x74)
+            } else {
+                visuals.bg_fill
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, visuals.corner_radius, fill);
+            painter.rect_stroke(
+                rect,
+                visuals.corner_radius,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + pad.x + icon * 0.5, rect.center().y),
+                egui::vec2(icon, icon),
+            );
+            paint_icon(painter, icon_rect, self.icon, visuals.fg_stroke.color);
+            painter.galley(
+                egui::pos2(
+                    icon_rect.right() + gap,
+                    rect.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                visuals.fg_stroke.color,
+            );
+        }
+        response
+    }
+}
+
+fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    let c = rect.center();
+    let s = rect.width().min(rect.height());
+    match icon {
+        Icon::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - s * 0.28, c.y - s * 0.38),
+                    egui::pos2(c.x - s * 0.28, c.y + s * 0.38),
+                    egui::pos2(c.x + s * 0.38, c.y),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Pause => {
+            let h = s * 0.38;
+            let w = s * 0.16;
+            for dx in [-s * 0.22, s * 0.06] {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(c.x + dx, c.y - h),
+                        egui::vec2(w, h * 2.0),
+                    ),
+                    1.0,
+                    color,
+                );
+            }
+        }
+        Icon::Back => painter.arrow(
+            c + egui::vec2(s * 0.2, 0.0),
+            egui::vec2(-s * 0.55, 0.0),
+            stroke,
+        ),
+        Icon::Forward => painter.arrow(
+            c - egui::vec2(s * 0.2, 0.0),
+            egui::vec2(s * 0.55, 0.0),
+            stroke,
+        ),
+        Icon::Go => painter.arrow(
+            c - egui::vec2(s * 0.28, 0.0),
+            egui::vec2(s * 0.55, 0.0),
+            stroke,
+        ),
+        Icon::Up => painter.arrow(
+            c + egui::vec2(0.0, s * 0.15),
+            egui::vec2(0.0, -s * 0.5),
+            stroke,
+        ),
+        Icon::Down => painter.arrow(
+            c - egui::vec2(0.0, s * 0.15),
+            egui::vec2(0.0, s * 0.5),
+            stroke,
+        ),
+        Icon::Mark => {
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - s * 0.28, c.y - s * 0.4),
+                    egui::pos2(c.x - s * 0.28, c.y + s * 0.4),
+                ],
+                stroke,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - s * 0.28, c.y - s * 0.4),
+                    egui::pos2(c.x + s * 0.32, c.y - s * 0.22),
+                    egui::pos2(c.x - s * 0.28, c.y - s * 0.04),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Plus => {
+            painter.line_segment(
+                [c - egui::vec2(s * 0.32, 0.0), c + egui::vec2(s * 0.32, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c - egui::vec2(0.0, s * 0.32), c + egui::vec2(0.0, s * 0.32)],
+                stroke,
+            );
+        }
+        Icon::Update => {
+            painter.circle_stroke(c, s * 0.28, stroke);
+            painter.arrow(
+                egui::pos2(c.x + s * 0.02, c.y - s * 0.28),
+                egui::vec2(s * 0.28, 0.05),
+                stroke,
+            );
+        }
+        Icon::Export => {
+            painter.arrow(
+                c - egui::vec2(0.0, s * 0.34),
+                egui::vec2(0.0, s * 0.38),
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - s * 0.34, c.y + s * 0.28),
+                    egui::pos2(c.x + s * 0.34, c.y + s * 0.28),
+                ],
+                stroke,
+            );
+        }
+        Icon::Remove => {
+            let d = s * 0.28;
+            painter.line_segment([c - egui::vec2(d, d), c + egui::vec2(d, d)], stroke);
+            painter.line_segment([c - egui::vec2(d, -d), c + egui::vec2(d, -d)], stroke);
+        }
+        Icon::Clear => {
+            painter.rect_stroke(rect.shrink(1.5), 1.0, stroke, egui::StrokeKind::Inside);
+            let d = s * 0.18;
+            painter.line_segment([c - egui::vec2(d, d), c + egui::vec2(d, d)], stroke);
+            painter.line_segment([c - egui::vec2(d, -d), c + egui::vec2(d, -d)], stroke);
+        }
+        Icon::Folder => {
+            let top = rect.top() + s * 0.28;
+            let tab = top - s * 0.16;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 1.0, top),
+                    egui::pos2(rect.left() + s * 0.38, top),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + s * 0.38, top),
+                    egui::pos2(rect.left() + s * 0.5, tab),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + s * 0.5, tab),
+                    egui::pos2(rect.right() - 1.0, tab),
+                ],
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 1.0, top),
+                    egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+                ),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
 }
 
 fn muted(text: &str) -> egui::RichText {
