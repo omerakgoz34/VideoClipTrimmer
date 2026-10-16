@@ -1337,16 +1337,49 @@ fn color_args(segment: &Segment) -> Vec<String> {
     if segment.color_range == "tv" || segment.color_range == "pc" {
         args.extend(["-color_range".into(), segment.color_range.clone()]);
     }
-    if !segment.color_space.is_empty() {
-        args.extend(["-colorspace".into(), segment.color_space.clone()]);
+    // One name each. A slash-joined triple is not a legal encoder option.
+    if let Some(name) = usable_color(&segment.color_space) {
+        args.extend(["-colorspace".into(), name]);
     }
-    if !segment.color_primaries.is_empty() {
-        args.extend(["-color_primaries".into(), segment.color_primaries.clone()]);
+    if let Some(name) = usable_color(&segment.color_primaries) {
+        args.extend(["-color_primaries".into(), name]);
     }
-    if !segment.color_transfer.is_empty() {
-        args.extend(["-color_trc".into(), segment.color_transfer.clone()]);
+    if let Some(name) = usable_color(&segment.color_transfer) {
+        args.extend(["-color_trc".into(), name]);
     }
     args
+}
+
+/// ffmpeg prints matrix/primaries/transfer as one field, for example
+/// `unknown/bt709/iec61966-2-1`. `unknown` is not a value an encoder accepts.
+fn split_color_spec(spec: &str) -> (String, String, String) {
+    let parts: Vec<&str> = spec
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let keep = |name: &str| match name {
+        "" | "unknown" | "unspecified" | "reserved" => String::new(),
+        other => other.to_string(),
+    };
+    match parts.as_slice() {
+        [space, primaries, transfer] => (keep(primaries), keep(transfer), keep(space)),
+        ["bt2020" | "bt2020nc"] => ("bt2020".into(), String::new(), "bt2020nc".into()),
+        [one] => {
+            let name = keep(one);
+            (name.clone(), name.clone(), name)
+        }
+        _ => (String::new(), String::new(), String::new()),
+    }
+}
+
+fn usable_color(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name == "unknown" || name == "unspecified" {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// `8000k` or `8M`, or a plain number of kilobits (`192` → `192k`).
@@ -1786,14 +1819,7 @@ fn parse_pix_fmt(line: &str) -> Option<PixFmt> {
     if name.starts_with("yuvj") && range.is_empty() {
         range = "pc".to_string();
     }
-    let (primaries, transfer, space) = match space.as_str() {
-        "bt709" => ("bt709".into(), "bt709".into(), "bt709".into()),
-        "bt470bg" => ("bt470bg".into(), "bt470bg".into(), "bt470bg".into()),
-        "smpte170m" => ("smpte170m".into(), "smpte170m".into(), "smpte170m".into()),
-        "bt2020" | "bt2020nc" => ("bt2020".into(), String::new(), "bt2020nc".into()),
-        "" => (String::new(), String::new(), String::new()),
-        other => (String::new(), String::new(), other.to_string()),
-    };
+    let (primaries, transfer, space) = split_color_spec(&space);
     Some(PixFmt {
         pix_fmt: name.to_string(),
         range,
@@ -1931,6 +1957,14 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert_eq!(parsed.primaries, "bt709");
         assert_eq!(parsed.transfer, "bt709");
         assert_eq!(first_bitrate_bps(line), Some(4_500_000));
+
+        let screen = parse_pix_fmt(
+            "Video: h264, yuv420p(tv, unknown/bt709/iec61966-2-1, progressive), 1920x1080",
+        )
+        .unwrap();
+        assert_eq!(screen.space, "");
+        assert_eq!(screen.primaries, "bt709");
+        assert_eq!(screen.transfer, "iec61966-2-1");
     }
 
     #[test]
