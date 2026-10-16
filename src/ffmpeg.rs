@@ -62,8 +62,7 @@ pub struct MediaInfo {
     pub color_space: String,
     pub color_primaries: String,
     pub color_transfer: String,
-    /// Bits per second, when the probe printed a stream bitrate.
-    pub video_bitrate: Option<u64>,
+    /// Bits per second, when the probe printed an audio bitrate.
     pub audio_bitrate: Option<u64>,
 }
 
@@ -1628,7 +1627,6 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
     let mut color_space = String::new();
     let mut color_primaries = String::new();
     let mut color_transfer = String::new();
-    let mut video_bitrate = None;
     let mut has_audio = false;
     let mut audio_codec = String::new();
     let mut audio_bitrate = None;
@@ -1650,7 +1648,6 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
                 color_primaries = parsed.primaries;
                 color_transfer = parsed.transfer;
             }
-            video_bitrate = first_bitrate_bps(line);
         }
         if line.contains("Audio:") && !has_audio {
             has_audio = true;
@@ -1689,7 +1686,6 @@ fn parse_probe(text: &str) -> Result<MediaInfo, String> {
         color_space,
         color_primaries,
         color_transfer,
-        video_bitrate,
         audio_bitrate,
     })
 }
@@ -1922,7 +1918,6 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert_eq!(info.video_codec, "h264");
         assert_eq!(info.audio_codec, "aac");
         assert_eq!(info.pix_fmt, "yuv420p");
-        assert_eq!(info.video_bitrate, Some(63_000));
         assert_eq!(info.audio_bitrate, Some(69_000));
     }
 
