@@ -301,14 +301,24 @@ impl App {
         }
         let mut close = false;
         egui::Modal::new(egui::Id::new("ffmpeg-missing")).show(ctx, |ui| {
-            ui.set_min_width(320.0);
-            ui.colored_label(rgb(0xe0, 0x7a, 0x5f), FFMPEG_MISSING);
-            ui.add_space(6.0);
-            ui.label("Install ffmpeg, then open the app again.");
-            ui.add_space(8.0);
-            if ui.button("OK").clicked() {
-                close = true;
-            }
+            ui.set_min_width(360.0);
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(FFMPEG_MISSING).color(rgb(0xe0, 0x7a, 0x5f)),
+                    )
+                    .halign(egui::Align::Center),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new("Install ffmpeg, then open the app again.")
+                        .halign(egui::Align::Center),
+                );
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
         });
         if close {
             self.warn_ffmpeg = false;
