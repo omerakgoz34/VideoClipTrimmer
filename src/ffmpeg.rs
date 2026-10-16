@@ -159,9 +159,26 @@ pub fn ffmpeg_program() -> String {
     "ffmpeg".to_string()
 }
 
+/// ffmpeg is a console program. A Windows GUI build would otherwise open a
+/// terminal for every command.
+fn ffmpeg_cmd() -> Command {
+    let program = ffmpeg_program();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(&program);
+        command.creation_flags(0x0800_0000);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
+    }
+}
+
 pub fn check_ffmpeg() -> Result<String, String> {
     let program = ffmpeg_program();
-    let output = Command::new(&program).arg("-version").output().map_err(|err| {
+    let output = ffmpeg_cmd().arg("-version").output().map_err(|err| {
         format!(
             "ffmpeg was not found ({program}). Install it and make sure it is on PATH, or set the FFMPEG variable.\n{err}"
         )
@@ -174,7 +191,7 @@ pub fn check_ffmpeg() -> Result<String, String> {
 }
 
 pub fn probe(path: &Path) -> Result<MediaInfo, String> {
-    let output = Command::new(ffmpeg_program())
+    let output = ffmpeg_cmd()
         .args(["-hide_banner", "-i"])
         .arg(path)
         .output()
@@ -221,11 +238,19 @@ pub fn grab_frame(path: &Path, time: f64, hw: HwAccel) -> Result<GrabOutcome, St
 }
 
 fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, String> {
-    let mut command = Command::new(ffmpeg_program());
+    let mut filter =
+        String::from("scale=960:960:force_original_aspect_ratio=decrease:flags=fast_bilinear");
+    if time > 0.001 {
+        filter = format!("trim=start={time:.3},setpts=PTS-STARTPTS,{filter}");
+    }
+    let mut command = ffmpeg_cmd();
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if time > 0.001 {
+        command.args(["-copyts", "-ss", &format!("{time:.3}")]);
+    }
     command
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(hw_decode_args(hw))
-        .args(["-ss", &format!("{time:.3}"), "-i"])
+        .arg("-i")
         .arg(path)
         .args([
             "-map",
@@ -235,7 +260,7 @@ fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, Str
             "1",
             // Fit inside a 960 box. Preview only — the export keeps full resolution.
             "-vf",
-            "scale=960:960:force_original_aspect_ratio=decrease:flags=fast_bilinear",
+            &filter,
             "-c:v",
             "mjpeg",
             "-q:v",
@@ -272,6 +297,7 @@ pub struct PlaySession {
     pub hw: HwAccel,
     rx: mpsc::Receiver<PlayEvent>,
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
@@ -295,6 +321,11 @@ impl PlaySession {
     pub fn try_recv(&self) -> Result<PlayEvent, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
+
+    /// Stops decoding without killing ffmpeg, so play can continue on the same frame.
+    pub fn set_paused(&self, paused: bool) {
+        self.pause.store(paused, Ordering::SeqCst);
+    }
 }
 
 impl Drop for PlaySession {
@@ -311,18 +342,21 @@ impl Drop for PlaySession {
 
 pub fn spawn_play(request: PlayRequest) -> PlaySession {
     let stop = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
     let child = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::sync_channel(2);
     let stop_worker = Arc::clone(&stop);
+    let pause_worker = Arc::clone(&pause);
     let child_worker = Arc::clone(&child);
     let path = request.path.clone();
     let hw = request.hw;
-    thread::spawn(move || play_worker(request, stop_worker, child_worker, tx));
+    thread::spawn(move || play_worker(request, stop_worker, pause_worker, child_worker, tx));
     PlaySession {
         path,
         hw,
         rx,
         stop,
+        pause,
         child,
     }
 }
@@ -330,17 +364,18 @@ pub fn spawn_play(request: PlayRequest) -> PlaySession {
 fn play_worker(
     request: PlayRequest,
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
     tx: mpsc::SyncSender<PlayEvent>,
 ) {
     let hw = request.hw;
-    match play_decode(&request, hw, &stop, &child, &tx) {
+    match play_decode(&request, hw, &stop, &pause, &child, &tx) {
         Ok(()) => {}
         Err(err) if hw != HwAccel::Off && !stop.load(Ordering::Relaxed) => {
             let _ = tx.try_send(PlayEvent::Warning(
                 "Hardware decode failed. Using the CPU decoder instead.".into(),
             ));
-            if let Err(soft) = play_decode(&request, HwAccel::Off, &stop, &child, &tx) {
+            if let Err(soft) = play_decode(&request, HwAccel::Off, &stop, &pause, &child, &tx) {
                 let _ = tx.try_send(PlayEvent::Failed(format!(
                     "{err}\nSoftware decode failed as well.\n{soft}"
                 )));
@@ -352,10 +387,26 @@ fn play_worker(
     }
 }
 
+/// Pause holds ffmpeg on the current frame. The wait is not counted as falling behind.
+fn block_while_paused(pause: &AtomicBool, stop: &AtomicBool, paused_for: &mut Duration) -> bool {
+    if pause.load(Ordering::Relaxed) {
+        let started = Instant::now();
+        while pause.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        *paused_for += started.elapsed();
+    }
+    !stop.load(Ordering::Relaxed)
+}
+
 fn play_decode(
     request: &PlayRequest,
     hw: HwAccel,
     stop: &AtomicBool,
+    pause: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     tx: &mpsc::SyncSender<PlayEvent>,
 ) -> Result<(), String> {
@@ -373,14 +424,28 @@ fn play_decode(
         *slot = None;
     }
     let scale = format!("scale={width}:{height}:flags=fast_bilinear");
-    let mut command = Command::new(ffmpeg_program());
+    // `-ss` before `-i` lands on the previous keyframe. Hardware decoders then
+    // output that frame. `trim` throws those frames away so playback starts
+    // on the frame that was showing.
+    let filter = if request.start > 0.001 {
+        format!(
+            "trim=start={:.3},setpts=PTS-STARTPTS,{scale}",
+            request.start
+        )
+    } else {
+        scale
+    };
+    let mut command = ffmpeg_cmd();
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if request.start > 0.001 {
+        command.args(["-copyts", "-ss", &format!("{:.3}", request.start)]);
+    }
     command
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
         .args(hw_decode_args(hw))
-        .args(["-ss", &format!("{:.3}", request.start), "-i"])
+        .arg("-i")
         .arg(&request.path)
         .args([
-            "-map", "0:v:0", "-an", "-vf", &scale, "-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1",
+            "-map", "0:v:0", "-an", "-vf", &filter, "-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -413,8 +478,9 @@ fn play_decode(
     let mut pixels = vec![0u8; frame_bytes];
     let mut index = 0u64;
     let clock = Instant::now();
+    let mut paused_for = Duration::ZERO;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if !block_while_paused(pause, stop, &mut paused_for) {
             return Ok(());
         }
         if stdout.read_exact(&mut pixels).is_err() {
@@ -432,16 +498,21 @@ fn play_decode(
         let time = request.start + index as f64 / fps;
         index += 1;
         let due = Duration::from_secs_f64(index as f64 / fps);
-        if clock.elapsed().saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
-            // Behind realtime: drop the frame instead of queueing a slideshow.
-            continue;
-        }
-        while clock.elapsed() + Duration::from_millis(2) < due {
-            if stop.load(Ordering::Relaxed) {
+        loop {
+            if !block_while_paused(pause, stop, &mut paused_for) {
                 return Ok(());
             }
-            let left = due.saturating_sub(clock.elapsed());
+            let elapsed = clock.elapsed().saturating_sub(paused_for);
+            if elapsed + Duration::from_millis(2) >= due {
+                break;
+            }
+            let left = due.saturating_sub(elapsed);
             thread::sleep(left.min(Duration::from_millis(8)));
+        }
+        let elapsed = clock.elapsed().saturating_sub(paused_for);
+        if elapsed.saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
+            // Behind realtime: drop the frame instead of queueing a slideshow.
+            continue;
         }
         let frame = RgbaFrame {
             width,
@@ -924,7 +995,7 @@ fn concat_files(
 /// First keyframe at or after `start`. `None` when ffmpeg did not report one.
 fn next_keyframe(path: &Path, start: f64) -> Result<Option<f64>, ExportError> {
     let filter = format!("select='eq(pict_type\\,I)*gte(t\\,{start:.3})',showinfo");
-    let output = Command::new(ffmpeg_program())
+    let output = ffmpeg_cmd()
         .args([
             "-hide_banner",
             "-loglevel",
@@ -1472,7 +1543,7 @@ fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
     if hw == HwAccel::Intel && cfg!(windows) {
         return intel_windows_encoder_accepts(dest);
     }
-    let mut cmd = Command::new(ffmpeg_program());
+    let mut cmd = ffmpeg_cmd();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     cmd.args(hw_device_init(hw));
     cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.08"]);
@@ -1487,7 +1558,7 @@ fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
 /// Lavfi frames are not D3D11 surfaces, so the Windows probe transcodes a tiny file.
 fn intel_windows_encoder_accepts(dest: &Path) -> bool {
     let tiny = dest.with_extension("src.mp4");
-    let mut make = Command::new(ffmpeg_program());
+    let mut make = ffmpeg_cmd();
     make.args([
         "-hide_banner",
         "-loglevel",
@@ -1521,7 +1592,7 @@ fn intel_probe_encode(
     target: &Target,
     gpu: bool,
 ) -> bool {
-    let mut cmd = Command::new(ffmpeg_program());
+    let mut cmd = ffmpeg_cmd();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     if gpu {
         cmd.args(intel_gpu_input_args());
@@ -1547,7 +1618,7 @@ fn intel_probe_encode(
 }
 
 fn decoder_accepts(hw: HwAccel, src: &Path) -> bool {
-    let mut cmd = Command::new(ffmpeg_program());
+    let mut cmd = ffmpeg_cmd();
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     cmd.args(hw_decode_args(hw));
     cmd.arg("-i").arg(src);
@@ -1793,7 +1864,7 @@ fn run_with_progress(
     let _ = std::fs::write(progress_path, b"");
     (hooks.log)(shell_join(args));
 
-    let mut child = Command::new(ffmpeg_program())
+    let mut child = ffmpeg_cmd()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2484,7 +2555,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.mp4");
-        let status = Command::new(ffmpeg_program())
+        let status = ffmpeg_cmd()
             .args([
                 "-y",
                 "-hide_banner",

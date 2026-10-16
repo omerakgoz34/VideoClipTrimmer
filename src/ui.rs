@@ -145,7 +145,6 @@ impl App {
 
     pub fn wants_redraw(&self) -> bool {
         self.playing
-            || self.play.is_some()
             || self.grab.is_some()
             || self.job.is_some()
             || self.wanted_time.is_some()
@@ -415,6 +414,7 @@ impl App {
             self.out_point,
         ) {
             self.playing = false;
+            self.play = None;
             self.playhead = time;
             self.wanted_time = Some(time);
             self.clear_armed = false;
@@ -738,7 +738,13 @@ impl App {
             self.pump_play(ctx);
             return;
         }
-        self.play = None;
+        // A seek needs a new frame. Pause keeps the decoder so play continues
+        // on this frame instead of jumping back to the previous keyframe.
+        if self.wanted_time.is_some() {
+            self.play = None;
+        } else if let Some(play) = &self.play {
+            play.set_paused(true);
+        }
 
         let finished = self.grab.as_ref().and_then(|rx| rx.try_recv().ok());
         if finished.is_some() {
@@ -819,6 +825,8 @@ impl App {
                 height,
                 hw,
             }));
+        } else if let Some(play) = &self.play {
+            play.set_paused(false);
         }
         let events = {
             let Some(play) = &self.play else {
@@ -989,6 +997,7 @@ impl App {
                 self.clamp_range();
                 self.write_time_fields();
                 self.playing = false;
+                self.play = None;
                 self.wanted_time = Some(self.playhead);
                 self.notice = Notice::None;
             }
@@ -1046,6 +1055,7 @@ impl App {
             self.write_time_fields();
             self.wanted_time = Some(self.playhead);
             self.playing = false;
+            self.play = None;
         } else {
             self.load_file(path, Some(range));
             self.selected = Some(index);
@@ -1159,18 +1169,26 @@ impl App {
         }
         if self.playing {
             self.playing = false;
+            if let Some(play) = &self.play {
+                play.set_paused(true);
+            }
             return;
         }
         if self.playhead >= self.out_point - 0.05 {
             self.playhead = self.in_point;
+            self.play = None;
+            self.shown_time = None;
         }
         self.playing = true;
         self.wanted_time = None;
-        self.play = None;
+        if let Some(play) = &self.play {
+            play.set_paused(false);
+        }
     }
 
     fn nudge(&mut self, delta: f64) {
         self.playing = false;
+        self.play = None;
         let duration = self.duration();
         self.playhead = (self.playhead + delta).clamp(0.0, duration);
         self.wanted_time = Some(self.playhead);
@@ -1178,6 +1196,7 @@ impl App {
 
     fn seek(&mut self, time: f64) {
         self.playing = false;
+        self.play = None;
         self.playhead = time.clamp(0.0, self.duration());
         self.wanted_time = Some(self.playhead);
     }
