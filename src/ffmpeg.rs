@@ -18,8 +18,8 @@ use crate::timeutil::parse_time;
 pub enum EncodeMode {
     /// Re-encode so clips with different sizes or codecs can be joined.
     Compatible,
-    /// Stream copy. Fast, but a cut starts at the previous keyframe,
-    /// and a join only works when the clips already match.
+    /// Stream copy. The cut starts on the frame you set. A short opening
+    /// is re-encoded only when that frame is not a keyframe.
     FastCopy,
 }
 
@@ -81,6 +81,9 @@ pub struct Segment {
     pub color_space: String,
     pub color_primaries: String,
     pub color_transfer: String,
+    /// Empty when the probe did not name the codec.
+    pub video_codec: String,
+    pub audio_codec: String,
 }
 
 impl MediaInfo {
@@ -98,6 +101,8 @@ impl MediaInfo {
             color_space: self.color_space.clone(),
             color_primaries: self.color_primaries.clone(),
             color_transfer: self.color_transfer.clone(),
+            video_codec: self.video_codec.clone(),
+            audio_codec: self.audio_codec.clone(),
         }
     }
 }
@@ -504,7 +509,16 @@ pub fn export(
 
     if segments.len() == 1 {
         (hooks.progress)(0.0);
-        encode_segment(&segments[0], dest, mode, None, settings, hooks, (0.0, 1.0))?;
+        encode_segment(
+            &segments[0],
+            dest,
+            mode,
+            None,
+            settings,
+            hooks,
+            (0.0, 1.0),
+            true,
+        )?;
         (hooks.progress)(1.0);
         return Ok(());
     }
@@ -519,7 +533,16 @@ pub fn export(
         let end = encode_share * (index as f32 + 1.0) / segments.len() as f32;
         // Joined clips have to share a size. The first clip decides it.
         let target = Some(output_target(&segments[0]));
-        encode_segment(segment, &part, mode, target, settings, hooks, (start, end))?;
+        encode_segment(
+            segment,
+            &part,
+            mode,
+            target,
+            settings,
+            hooks,
+            (start, end),
+            true,
+        )?;
         parts.push(part);
     }
 
@@ -566,6 +589,7 @@ pub fn export(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_segment(
     segment: &Segment,
     dest: &Path,
@@ -574,7 +598,11 @@ fn encode_segment(
     settings: &EncodeSettings,
     hooks: &Hooks<'_>,
     progress: (f32, f32),
+    fill_silence: bool,
 ) -> Result<(), ExportError> {
+    if mode == EncodeMode::FastCopy {
+        return fast_copy_exact(segment, dest, settings, hooks, progress);
+    }
     let progress_path = dest.with_extension("progress");
     let gpu = mode == EncodeMode::Compatible && settings.hw == HwAccel::Intel && cfg!(windows);
     let args = encode_args(
@@ -585,6 +613,7 @@ fn encode_segment(
         settings,
         &progress_path,
         gpu,
+        fill_silence,
     )?;
     let duration = (segment.end - segment.start).max(0.05);
     match run_with_progress(
@@ -611,6 +640,7 @@ fn encode_segment(
                 settings,
                 &progress_path,
                 false,
+                fill_silence,
             )?;
             run_with_progress(
                 &slow,
@@ -627,6 +657,7 @@ fn encode_segment(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_args(
     segment: &Segment,
     dest: &Path,
@@ -635,6 +666,7 @@ fn encode_args(
     settings: &EncodeSettings,
     progress_path: &Path,
     gpu: bool,
+    fill_silence: bool,
 ) -> Result<Vec<String>, ExportError> {
     Ok(match mode {
         EncodeMode::FastCopy => fast_copy_args(segment, dest, progress_path),
@@ -659,6 +691,7 @@ fn encode_args(
                 &audio_bitrate,
                 settings.hw,
                 gpu,
+                fill_silence,
             )
         }
     })
@@ -674,7 +707,7 @@ fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String
         progress.display().to_string(),
         "-loglevel".into(),
         "error".into(),
-        // `-ss` before `-i` seeks quickly. With `-c copy` the cut snaps to a keyframe.
+        // `-ss` before `-i` is exact when this time is already a keyframe.
         "-ss".into(),
         format!("{:.3}", segment.start),
         "-t".into(),
@@ -693,6 +726,243 @@ fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String
     ]
 }
 
+/// Stream copy starts on a keyframe. When the chosen frame is later than that,
+/// re-encode just up to the next keyframe, then copy the rest.
+fn fast_copy_exact(
+    segment: &Segment,
+    dest: &Path,
+    settings: &EncodeSettings,
+    hooks: &Hooks<'_>,
+    progress: (f32, f32),
+) -> Result<(), ExportError> {
+    if !streams_can_be_copied(segment) {
+        (hooks.log)(
+            "This file cannot be copied from an exact frame. Re-encoding the range.".into(),
+        );
+        return reencode_range(segment, dest, settings, hooks, progress);
+    }
+    let key = next_keyframe(&segment.path, segment.start)?;
+    match copy_plan(segment.start, segment.end, segment.fps, key) {
+        CopyPlan::Copy => run_fast_copy(segment, dest, hooks, progress),
+        CopyPlan::Reencode => {
+            (hooks.log)(
+                "No keyframe inside this range. Re-encoding so the cut starts on the chosen frame."
+                    .into(),
+            );
+            reencode_range(segment, dest, settings, hooks, progress)
+        }
+        CopyPlan::Smart { key } => smart_cut(segment, key, dest, settings, hooks, progress),
+    }
+}
+
+fn streams_can_be_copied(segment: &Segment) -> bool {
+    let video = segment.video_codec.to_ascii_lowercase();
+    let video_ok = video.is_empty() || video == "h264" || video.starts_with("avc");
+    let audio = segment.audio_codec.to_ascii_lowercase();
+    let audio_ok = !segment.has_audio || audio.is_empty() || audio == "aac";
+    video_ok && audio_ok
+}
+
+enum CopyPlan {
+    Copy,
+    Reencode,
+    Smart { key: f64 },
+}
+
+/// `keyframe` is the first keyframe at or after `start`, when one was found.
+fn copy_plan(start: f64, end: f64, fps: f64, keyframe: Option<f64>) -> CopyPlan {
+    let half = (0.5 / fps.max(1.0)).max(0.02);
+    let Some(key) = keyframe else {
+        return CopyPlan::Reencode;
+    };
+    if key < start - half {
+        return CopyPlan::Reencode;
+    }
+    if (key - start).abs() <= half {
+        return CopyPlan::Copy;
+    }
+    if key >= end - 0.04 {
+        return CopyPlan::Reencode;
+    }
+    CopyPlan::Smart { key }
+}
+
+fn reencode_range(
+    segment: &Segment,
+    dest: &Path,
+    settings: &EncodeSettings,
+    hooks: &Hooks<'_>,
+    progress: (f32, f32),
+) -> Result<(), ExportError> {
+    encode_segment(
+        segment,
+        dest,
+        EncodeMode::Compatible,
+        None,
+        settings,
+        hooks,
+        progress,
+        true,
+    )
+}
+
+fn smart_cut(
+    segment: &Segment,
+    key: f64,
+    dest: &Path,
+    settings: &EncodeSettings,
+    hooks: &Hooks<'_>,
+    progress: (f32, f32),
+) -> Result<(), ExportError> {
+    (hooks.log)(format!(
+        "Re-encoding {:.3}s to {:.3}s so the cut starts on that frame. The rest is copied.",
+        segment.start, key
+    ));
+    let temp = TempDir::new()?;
+    let head_path = temp.0.join("head.mp4");
+    let tail_path = temp.0.join("tail.mp4");
+    let span = progress.1 - progress.0;
+    let mut head = segment.clone();
+    head.end = key;
+    encode_segment(
+        &head,
+        &head_path,
+        EncodeMode::Compatible,
+        None,
+        settings,
+        hooks,
+        (progress.0, progress.0 + span * 0.35),
+        false,
+    )?;
+    let mut tail = segment.clone();
+    tail.start = key;
+    run_fast_copy(
+        &tail,
+        &tail_path,
+        hooks,
+        (progress.0 + span * 0.35, progress.0 + span * 0.9),
+    )?;
+    check_cancel(hooks)?;
+    match concat_files(
+        &[&head_path, &tail_path],
+        dest,
+        hooks,
+        (progress.0 + span * 0.9, progress.1),
+    ) {
+        Ok(()) => Ok(()),
+        Err(ExportError::Cancelled) => Err(ExportError::Cancelled),
+        Err(err) => {
+            (hooks.log)(format!(
+                "Could not join the copied part ({err}). Re-encoding the whole range."
+            ));
+            let _ = std::fs::remove_file(dest);
+            reencode_range(segment, dest, settings, hooks, progress)
+        }
+    }
+}
+
+fn run_fast_copy(
+    segment: &Segment,
+    dest: &Path,
+    hooks: &Hooks<'_>,
+    progress: (f32, f32),
+) -> Result<(), ExportError> {
+    let progress_path = dest.with_extension("progress");
+    let args = fast_copy_args(segment, dest, &progress_path);
+    let duration = (segment.end - segment.start).max(0.05);
+    let result = run_with_progress(
+        &args,
+        &progress_path,
+        duration,
+        hooks,
+        progress.0,
+        progress.1,
+    );
+    let _ = std::fs::remove_file(&progress_path);
+    result
+}
+
+fn concat_files(
+    parts: &[&Path],
+    dest: &Path,
+    hooks: &Hooks<'_>,
+    progress: (f32, f32),
+) -> Result<(), ExportError> {
+    let temp = TempDir::new()?;
+    let list_path = temp.0.join("list.txt");
+    let progress_path = temp.0.join("progress.txt");
+    let list = parts
+        .iter()
+        .map(|path| concat_line(path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&list_path, list + "\n")
+        .map_err(|err| ExportError::Message(format!("Could not write the concat list: {err}")))?;
+    let args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        progress_path.display().to_string(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        list_path.display().to_string(),
+        "-c".into(),
+        "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        dest.display().to_string(),
+    ];
+    run_with_progress(&args, &progress_path, 1.0, hooks, progress.0, progress.1)
+}
+
+/// First keyframe at or after `start`. `None` when ffmpeg did not report one.
+fn next_keyframe(path: &Path, start: f64) -> Result<Option<f64>, ExportError> {
+    let filter = format!("select='eq(pict_type\\,I)*gte(t\\,{start:.3})',showinfo");
+    let output = Command::new(ffmpeg_program())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-ss",
+            &format!("{start:.3}"),
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            &filter,
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|err| ExportError::Message(format!("Could not look for a keyframe: {err}")))?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    Ok(parse_showinfo_time(&text))
+}
+
+fn parse_showinfo_time(text: &str) -> Option<f64> {
+    let rest = text.split("pts_time:").nth(1)?;
+    let number: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || matches!(*ch, '.' | '-'))
+        .collect();
+    let value = number.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compatible_args(
     segment: &Segment,
@@ -703,6 +973,7 @@ fn compatible_args(
     audio_bitrate: &str,
     hw: HwAccel,
     gpu: bool,
+    fill_silence: bool,
 ) -> Vec<String> {
     let duration = segment.end - segment.start;
     let mut args = vec![
@@ -735,7 +1006,7 @@ fn compatible_args(
 
     if segment.has_audio {
         args.extend(["-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into()]);
-    } else {
+    } else if fill_silence {
         // A silent track keeps a join working when some clips have audio and some do not.
         args.extend([
             "-f".into(),
@@ -749,6 +1020,8 @@ fn compatible_args(
             "-map".into(),
             "1:a:0".into(),
         ]);
+    } else {
+        args.extend(["-map".into(), "0:v:0".into()]);
     }
 
     // Leave size, frame rate, and pixel format alone when they already match.
@@ -763,22 +1036,29 @@ fn compatible_args(
     }
 
     if gpu {
-        args.extend(intel_fast_encoder_args(segment, video_crf));
+        args.extend(intel_fast_encoder_args(video_crf));
     } else {
         args.extend(video_encoder_args(segment, video_crf, hw));
     }
-    args.extend([
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        audio_bitrate.to_string(),
-        "-ar".into(),
-        "48000".into(),
-        "-ac".into(),
-        "2".into(),
-    ]);
-    if !segment.has_audio {
+    if segment.has_audio || fill_silence {
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            audio_bitrate.to_string(),
+            "-ar".into(),
+            "48000".into(),
+            "-ac".into(),
+            "2".into(),
+        ]);
+    }
+    if !segment.has_audio && fill_silence {
         args.push("-shortest".into());
+    }
+    if let Some(filter) = color_bitstream_filter(segment) {
+        // Written onto the finished H.264 stream, so libx264, NVENC, AMF,
+        // Quick Sync, VAAPI, and VideoToolbox never have to parse the name.
+        args.extend(["-bsf:v".into(), filter]);
     }
     args.extend([
         "-movflags".into(),
@@ -822,9 +1102,9 @@ fn intel_gpu_filter(segment: &Segment, target: &Target) -> String {
     chain
 }
 
-fn intel_fast_encoder_args(segment: &Segment, crf: i32) -> Vec<String> {
+fn intel_fast_encoder_args(crf: i32) -> Vec<String> {
     let quality = crf.clamp(0, 51).to_string();
-    let mut args = vec![
+    let args = vec![
         "-c:v".into(),
         "h264_qsv".into(),
         // veryfast + low_power is Intel's VDENC path, the one HandBrake uses.
@@ -839,7 +1119,6 @@ fn intel_fast_encoder_args(segment: &Segment, crf: i32) -> Vec<String> {
         "-global_quality".into(),
         quality,
     ];
-    args.extend(color_args(segment));
     args
 }
 
@@ -952,7 +1231,6 @@ fn video_encoder_args(segment: &Segment, crf: i32, hw: HwAccel) -> Vec<String> {
     } else if !uses_hw_upload(hw) {
         args.extend(["-pix_fmt".into(), pix]);
     }
-    args.extend(color_args(segment));
     args
 }
 
@@ -1260,7 +1538,7 @@ fn intel_probe_encode(
         cmd.args(["-vf", &filter]);
     }
     if gpu {
-        cmd.args(intel_fast_encoder_args(segment, 23));
+        cmd.args(intel_fast_encoder_args(23));
     } else {
         cmd.args(video_encoder_args(segment, 23, HwAccel::Intel));
     }
@@ -1291,6 +1569,8 @@ fn probe_segment() -> Segment {
         color_space: String::new(),
         color_primaries: String::new(),
         color_transfer: String::new(),
+        video_codec: String::new(),
+        audio_codec: String::new(),
     }
 }
 
@@ -1332,22 +1612,75 @@ fn output_pix_fmt(segment: &Segment, hw: HwAccel) -> String {
     }
 }
 
-fn color_args(segment: &Segment) -> Vec<String> {
-    let mut args = Vec::new();
-    if segment.color_range == "tv" || segment.color_range == "pc" {
-        args.extend(["-color_range".into(), segment.color_range.clone()]);
+/// H.264 numbers, not names. No encoder option parser is involved.
+fn color_bitstream_filter(segment: &Segment) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(value) = matrix_code(&segment.color_space) {
+        parts.push(format!("matrix_coefficients={value}"));
     }
-    // One name each. A slash-joined triple is not a legal encoder option.
-    if let Some(name) = usable_color(&segment.color_space) {
-        args.extend(["-colorspace".into(), name]);
+    if let Some(value) = primaries_code(&segment.color_primaries) {
+        parts.push(format!("colour_primaries={value}"));
     }
-    if let Some(name) = usable_color(&segment.color_primaries) {
-        args.extend(["-color_primaries".into(), name]);
+    if let Some(value) = transfer_code(&segment.color_transfer) {
+        parts.push(format!("transfer_characteristics={value}"));
     }
-    if let Some(name) = usable_color(&segment.color_transfer) {
-        args.extend(["-color_trc".into(), name]);
+    match segment.color_range.as_str() {
+        "tv" => parts.push("video_full_range_flag=0".into()),
+        "pc" => parts.push("video_full_range_flag=1".into()),
+        _ => {}
     }
-    args
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("h264_metadata={}", parts.join(":")))
+    }
+}
+
+fn matrix_code(name: &str) -> Option<u8> {
+    match usable_color(name)?.as_str() {
+        "bt709" => Some(1),
+        "fcc" => Some(4),
+        "bt470bg" => Some(5),
+        "smpte170m" => Some(6),
+        "smpte240m" => Some(7),
+        "bt2020nc" => Some(9),
+        "bt2020c" => Some(10),
+        _ => None,
+    }
+}
+
+fn primaries_code(name: &str) -> Option<u8> {
+    match usable_color(name)?.as_str() {
+        "bt709" => Some(1),
+        "bt470m" => Some(4),
+        "bt470bg" => Some(5),
+        "smpte170m" => Some(6),
+        "smpte240m" => Some(7),
+        "film" => Some(8),
+        "bt2020" => Some(9),
+        "smpte428" => Some(10),
+        "smpte431" => Some(11),
+        "smpte432" => Some(12),
+        _ => None,
+    }
+}
+
+fn transfer_code(name: &str) -> Option<u8> {
+    match usable_color(name)?.as_str() {
+        "bt709" => Some(1),
+        "bt470m" | "gamma22" => Some(4),
+        "bt470bg" | "gamma28" => Some(5),
+        "smpte170m" => Some(6),
+        "smpte240m" => Some(7),
+        "linear" => Some(8),
+        "iec61966-2-4" => Some(11),
+        "iec61966-2-1" => Some(13),
+        "bt2020-10" => Some(14),
+        "bt2020-12" => Some(15),
+        "smpte2084" => Some(16),
+        "arib-std-b67" => Some(18),
+        _ => None,
+    }
 }
 
 /// ffmpeg prints matrix/primaries/transfer as one field, for example
@@ -1995,11 +2328,50 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             color_space: "bt709".into(),
             color_primaries: "bt709".into(),
             color_transfer: "bt709".into(),
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
         };
         let args = fast_copy_args(&segment, Path::new("out.mp4"), Path::new("p.txt"));
         assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
         assert!(args.iter().any(|a| a == "-avoid_negative_ts"));
         assert!(args.iter().any(|a| a == "1.500"));
+        assert!(matches!(
+            copy_plan(1.0, 2.5, 30.0, Some(1.0)),
+            CopyPlan::Copy
+        ));
+        assert!(matches!(
+            copy_plan(0.4, 2.5, 25.0, Some(1.0)),
+            CopyPlan::Smart { key } if (key - 1.0).abs() < 0.001
+        ));
+        assert!(matches!(
+            copy_plan(0.4, 2.5, 25.0, None),
+            CopyPlan::Reencode
+        ));
+        assert_eq!(
+            parse_showinfo_time("n: 0 pts: 3072 pts_time:1.024 type:I"),
+            Some(1.024)
+        );
+        let screen = Segment {
+            color_space: String::new(),
+            color_primaries: "bt709".into(),
+            color_transfer: "iec61966-2-1".into(),
+            color_range: "tv".into(),
+            ..segment
+        };
+        let filter = color_bitstream_filter(&screen).unwrap();
+        assert!(filter.contains("colour_primaries=1"));
+        assert!(filter.contains("transfer_characteristics=13"));
+        assert!(filter.contains("video_full_range_flag=0"));
+        assert!(!filter.contains("unknown"));
+        assert!(!filter.contains('/'));
+        assert!(color_bitstream_filter(&Segment {
+            color_space: "unknown/bt709/iec61966-2-1".into(),
+            color_primaries: String::new(),
+            color_transfer: String::new(),
+            color_range: String::new(),
+            ..screen
+        })
+        .is_none());
     }
 
     #[test]
@@ -2017,6 +2389,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             color_space: "bt709".into(),
             color_primaries: "bt709".into(),
             color_transfer: "bt709".into(),
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
         };
         let target = output_target(&segment);
         assert!(video_filter(&segment, &target, HwAccel::Off).is_none());
@@ -2029,12 +2403,19 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             "192k",
             HwAccel::Off,
             false,
+            true,
         );
         assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-b:v"));
         assert!(args.windows(2).any(|pair| pair == ["-crf", "18"]));
         assert!(args.windows(2).any(|pair| pair == ["-b:a", "192k"]));
-        assert!(args.windows(2).any(|pair| pair == ["-color_range", "tv"]));
-        assert!(args.windows(2).any(|pair| pair == ["-colorspace", "bt709"]));
+        assert!(args.iter().any(|arg| arg.contains("h264_metadata=")));
+        assert!(args.iter().any(|arg| arg.contains("matrix_coefficients=1")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("transfer_characteristics=1")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "-colorspace" || arg == "-color_trc"));
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
 
         let nvidia = video_encoder_args(&segment, 18, HwAccel::Nvidia);

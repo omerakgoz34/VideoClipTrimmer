@@ -540,7 +540,7 @@ impl App {
                 "Re-encodes at the CRF above. Lower keeps more of the picture. Size, frame rate, and color tags stay as they are, unless clips must be matched to the first one. Hardware also decodes the preview."
             }
             EncodeMode::FastCopy => {
-                "No re-encode. A cut starts near the previous keyframe. Joins need matching files. Hardware still decodes the preview when it is on."
+                "Copies the file. The cut starts on the frame you set, re-encoding only up to the next keyframe when it has to. Joins need matching files. Hardware still decodes the preview when it is on."
             }
         }));
 
