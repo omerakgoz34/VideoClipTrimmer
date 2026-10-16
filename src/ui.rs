@@ -274,8 +274,6 @@ impl App {
             ui.add_space(8.0);
             if let Some(media) = &self.media {
                 ui.label(file_label(&media.path));
-            } else {
-                ui.label(muted("Cut a range, or join several."));
             }
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
