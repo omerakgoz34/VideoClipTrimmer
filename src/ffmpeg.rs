@@ -209,25 +209,29 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 
 pub struct GrabOutcome {
     pub frame: RgbaFrame,
+    pub time: f64,
     pub warning: Option<String>,
 }
 
 pub fn grab_frame(path: &Path, time: f64, hw: HwAccel) -> Result<GrabOutcome, String> {
     if hw == HwAccel::Off {
-        let frame = grab_frame_once(path, time, HwAccel::Off)?;
+        let (frame, time) = grab_frame_once(path, time, HwAccel::Off)?;
         return Ok(GrabOutcome {
             frame,
+            time,
             warning: None,
         });
     }
     match grab_frame_once(path, time, hw) {
-        Ok(frame) => Ok(GrabOutcome {
+        Ok((frame, actual)) => Ok(GrabOutcome {
             frame,
+            time: actual,
             warning: None,
         }),
         Err(err) => match grab_frame_once(path, time, HwAccel::Off) {
-            Ok(frame) => Ok(GrabOutcome {
+            Ok((frame, actual)) => Ok(GrabOutcome {
                 frame,
+                time: actual,
                 warning: Some(format!(
                     "Hardware decode failed. Using the CPU decoder instead.\n{err}"
                 )),
@@ -237,18 +241,34 @@ pub fn grab_frame(path: &Path, time: f64, hw: HwAccel) -> Result<GrabOutcome, St
     }
 }
 
-fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, String> {
-    let mut filter =
-        String::from("scale=960:960:force_original_aspect_ratio=decrease:flags=fast_bilinear");
+/// `-ss` before `-i` stops on the previous keyframe. `-copyts` keeps the
+/// original timestamps so `trim` can drop everything before `time`.
+fn accurate_seek_args(time: f64) -> Vec<String> {
     if time > 0.001 {
-        filter = format!("trim=start={time:.3},setpts=PTS-STARTPTS,{filter}");
+        vec!["-copyts".into(), "-ss".into(), format!("{time:.3}")]
+    } else {
+        Vec::new()
     }
+}
+
+/// Same filter for a still frame and for playback, so both show the same picture.
+fn preview_vf(time: f64, scale: &str) -> String {
+    if time > 0.001 {
+        format!("trim=start={time:.3},showinfo,{scale}")
+    } else {
+        format!("showinfo,{scale}")
+    }
+}
+
+fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<(RgbaFrame, f64), String> {
+    let filter = preview_vf(
+        time,
+        "scale=960:960:force_original_aspect_ratio=decrease:flags=fast_bilinear",
+    );
     let mut command = ffmpeg_cmd();
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if time > 0.001 {
-        command.args(["-copyts", "-ss", &format!("{time:.3}")]);
-    }
     command
+        .args(["-hide_banner", "-loglevel", "info", "-nostdin"])
+        .args(accurate_seek_args(time))
         .args(hw_decode_args(hw))
         .arg("-i")
         .arg(path)
@@ -283,11 +303,15 @@ fn grab_frame_once(path: &Path, time: f64, hw: HwAccel) -> Result<RgbaFrame, Str
     let image = image::load_from_memory(&output.stdout)
         .map_err(|err| format!("Could not decode the preview frame: {err}"))?;
     let rgba = image.to_rgba8();
-    Ok(RgbaFrame {
-        width: rgba.width(),
-        height: rgba.height(),
-        pixels: rgba.into_raw(),
-    })
+    let actual = parse_showinfo_time(&String::from_utf8_lossy(&output.stderr)).unwrap_or(time);
+    Ok((
+        RgbaFrame {
+            width: rgba.width(),
+            height: rgba.height(),
+            pixels: rgba.into_raw(),
+        },
+        actual,
+    ))
 }
 
 /// One open ffmpeg process that decodes forward. Playback reads this instead of
@@ -424,23 +448,11 @@ fn play_decode(
         *slot = None;
     }
     let scale = format!("scale={width}:{height}:flags=fast_bilinear");
-    // `-ss` before `-i` lands on the previous keyframe. Hardware decoders then
-    // output that frame. `trim` throws those frames away so playback starts
-    // on the frame that was showing.
-    let filter = if request.start > 0.001 {
-        format!(
-            "trim=start={:.3},setpts=PTS-STARTPTS,{scale}",
-            request.start
-        )
-    } else {
-        scale
-    };
+    let filter = preview_vf(request.start, &scale);
     let mut command = ffmpeg_cmd();
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if request.start > 0.001 {
-        command.args(["-copyts", "-ss", &format!("{:.3}", request.start)]);
-    }
     command
+        .args(["-hide_banner", "-loglevel", "info", "-nostdin"])
+        .args(accurate_seek_args(request.start))
         .args(hw_decode_args(hw))
         .arg("-i")
         .arg(&request.path)
@@ -457,7 +469,7 @@ fn play_decode(
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg did not return a preview frame.".to_string())?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| "ffmpeg did not return a preview frame.".to_string())?;
@@ -467,8 +479,29 @@ fn play_decode(
     }
     let errors = Arc::new(Mutex::new(Vec::new()));
     let errors_worker = Arc::clone(&errors);
+    let (pts_tx, pts_rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = std::io::copy(&mut stderr, &mut Writer(&errors_worker));
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Some(time) = parse_showinfo_time(&line) {
+                        if pts_tx.send(time).is_err() {
+                            break;
+                        }
+                    }
+                    let mut buf = errors_worker.lock().unwrap();
+                    buf.extend(line.as_bytes());
+                    if buf.len() > 16 * 1024 {
+                        let keep = buf.len() - 8 * 1024;
+                        buf.drain(..keep);
+                    }
+                }
+            }
+        }
     });
     if stop.load(Ordering::Relaxed) {
         return Ok(());
@@ -477,7 +510,7 @@ fn play_decode(
     let frame_bytes = width as usize * height as usize * 4;
     let mut pixels = vec![0u8; frame_bytes];
     let mut index = 0u64;
-    let clock = Instant::now();
+    let mut origin: Option<Instant> = None;
     let mut paused_for = Duration::ZERO;
     loop {
         if !block_while_paused(pause, stop, &mut paused_for) {
@@ -495,23 +528,36 @@ fn play_decode(
             let _ = tx.try_send(PlayEvent::Ended);
             return Ok(());
         }
-        let time = request.start + index as f64 / fps;
+        // The picture's own timestamp. Counting frames drifts off the cut points.
+        let time = pts_rx
+            .recv_timeout(Duration::from_millis(300))
+            .unwrap_or_else(|_| request.start + index as f64 / fps);
         index += 1;
-        let due = Duration::from_secs_f64(index as f64 / fps);
+        if origin.is_none() {
+            origin = Some(Instant::now());
+        }
+        let due = Duration::from_secs_f64((index - 1) as f64 / fps);
         loop {
             if !block_while_paused(pause, stop, &mut paused_for) {
                 return Ok(());
             }
-            let elapsed = clock.elapsed().saturating_sub(paused_for);
+            let elapsed = origin
+                .unwrap_or_else(Instant::now)
+                .elapsed()
+                .saturating_sub(paused_for);
             if elapsed + Duration::from_millis(2) >= due {
                 break;
             }
             let left = due.saturating_sub(elapsed);
             thread::sleep(left.min(Duration::from_millis(8)));
         }
-        let elapsed = clock.elapsed().saturating_sub(paused_for);
-        if elapsed.saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
+        let elapsed = origin
+            .unwrap_or_else(Instant::now)
+            .elapsed()
+            .saturating_sub(paused_for);
+        if index > 1 && elapsed.saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
             // Behind realtime: drop the frame instead of queueing a slideshow.
+            // The first frame stays, so play starts on the same picture as a seek.
             continue;
         }
         let frame = RgbaFrame {
@@ -524,19 +570,6 @@ fn play_decode(
             Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
         }
-    }
-}
-
-/// Small writer so a background thread can drain ffmpeg's stderr without blocking it.
-struct Writer<'a>(&'a Mutex<Vec<u8>>);
-
-impl std::io::Write for Writer<'_> {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(data);
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -778,13 +811,14 @@ fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String
         progress.display().to_string(),
         "-loglevel".into(),
         "error".into(),
-        // `-ss` before `-i` is exact when this time is already a keyframe.
+        // Seek to a keyframe. `-t` is an output option so the length is the
+        // cut, not the distance from the keyframe before it.
         "-ss".into(),
         format!("{:.3}", segment.start),
-        "-t".into(),
-        format!("{:.3}", duration),
         "-i".into(),
         segment.path.display().to_string(),
+        "-t".into(),
+        format!("{:.3}", duration),
         "-map".into(),
         "0".into(),
         "-c".into(),
@@ -1000,6 +1034,7 @@ fn next_keyframe(path: &Path, start: f64) -> Result<Option<f64>, ExportError> {
             "-hide_banner",
             "-loglevel",
             "info",
+            "-copyts",
             "-ss",
             &format!("{start:.3}"),
             "-i",
@@ -1065,12 +1100,10 @@ fn compatible_args(
         args.extend(export_input_args(hw));
     }
     args.extend([
-        // `-ss` before `-i` is fast. Re-encoding still starts near the requested frame,
-        // because ffmpeg decodes back to the previous keyframe.
+        // Input `-ss` is fast. ffmpeg then discards frames until this time,
+        // so the encoded cut starts on the same frame the preview showed.
         "-ss".into(),
         format!("{:.3}", segment.start),
-        "-t".into(),
-        format!("{:.3}", duration),
         "-i".into(),
         segment.path.display().to_string(),
     ]);
@@ -1132,6 +1165,8 @@ fn compatible_args(
         args.extend(["-bsf:v".into(), filter]);
     }
     args.extend([
+        "-t".into(),
+        format!("{:.3}", duration),
         "-movflags".into(),
         "+faststart".into(),
         dest.display().to_string(),
@@ -2301,7 +2336,7 @@ pub fn spawn_grab(path: PathBuf, time: f64, seq: u64, hw: HwAccel) -> mpsc::Rece
         let grabbed = match grab_frame(&path, time, hw) {
             Ok(outcome) => Grabbed {
                 seq,
-                time,
+                time: outcome.time,
                 result: Ok(outcome.frame),
                 warning: outcome.warning,
             },
@@ -2406,6 +2441,11 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
         assert!(args.iter().any(|a| a == "-avoid_negative_ts"));
         assert!(args.iter().any(|a| a == "1.500"));
+        let seek = accurate_seek_args(1.5);
+        assert_eq!(seek, ["-copyts", "-ss", "1.500"]);
+        let filter = preview_vf(1.5, "scale=160:120");
+        assert!(filter.starts_with("trim=start=1.500,showinfo,"));
+        assert!(!filter.contains("setpts"));
         assert!(matches!(
             copy_plan(1.0, 2.5, 30.0, Some(1.0)),
             CopyPlan::Copy
@@ -2586,6 +2626,11 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
 
         let info = probe(&src).unwrap();
         assert!((info.duration - 2.0).abs() < 0.15);
+        let key = next_keyframe(&src, 0.5).unwrap().expect("keyframe");
+        assert!(
+            (key - 0.8).abs() < 0.08,
+            "next keyframe should be absolute, got {key}"
+        );
         assert_eq!((info.width, info.height), (160, 120));
         assert!(info.has_audio);
 

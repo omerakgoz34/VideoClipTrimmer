@@ -760,7 +760,15 @@ impl App {
             if seq == self.grab_seq {
                 match result {
                     Ok(frame) => {
-                        self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time)
+                        self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
+                        if !self.playing {
+                            let duration = self.duration();
+                            self.playhead = if duration > 0.0 {
+                                time.clamp(0.0, duration)
+                            } else {
+                                time.max(0.0)
+                            };
+                        }
                     }
                     Err(err) => self.fail(format!("Preview: {err}")),
                 }
