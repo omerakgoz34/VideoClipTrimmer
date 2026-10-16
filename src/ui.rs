@@ -55,6 +55,8 @@ pub struct App {
     play: Option<PlaySession>,
     job: Option<Job>,
     themed: bool,
+    /// Shown once at startup when ffmpeg is not installed.
+    warn_ffmpeg: bool,
 }
 
 struct Loaded {
@@ -92,6 +94,7 @@ enum Notice {
 impl App {
     pub fn new() -> Self {
         let ffmpeg = check_ffmpeg();
+        let warn_ffmpeg = ffmpeg.is_err();
         let saved_hw = load_saved_hw();
         let hw = saved_hw.unwrap_or(HwAccel::Off);
         // A saved choice means this is not the first launch. Don't probe again.
@@ -136,6 +139,7 @@ impl App {
             play: None,
             job: None,
             themed: false,
+            warn_ffmpeg,
         }
     }
 
@@ -219,6 +223,7 @@ impl App {
             .show(ctx, |ui| self.clip_list(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| self.stage(ui));
+        self.ffmpeg_popup(ctx);
     }
 
     fn ensure_theme(&mut self, ctx: &egui::Context) {
@@ -283,11 +288,31 @@ impl App {
                             .on_hover_text(version);
                     }
                     Err(_) => {
-                        ui.colored_label(rgb(0xe0, 0x7a, 0x5f), "ffmpeg missing");
+                        ui.colored_label(rgb(0xe0, 0x7a, 0x5f), FFMPEG_MISSING);
                     }
                 },
             );
         });
+    }
+
+    fn ffmpeg_popup(&mut self, ctx: &egui::Context) {
+        if !self.warn_ffmpeg {
+            return;
+        }
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("ffmpeg-missing")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.colored_label(rgb(0xe0, 0x7a, 0x5f), FFMPEG_MISSING);
+            ui.add_space(6.0);
+            ui.label("Install ffmpeg, then open the app again.");
+            ui.add_space(8.0);
+            if ui.button("OK").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.warn_ffmpeg = false;
+        }
     }
 
     fn stage(&mut self, ui: &mut egui::Ui) {
@@ -1372,6 +1397,8 @@ fn muted(text: &str) -> egui::RichText {
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
+
+const FFMPEG_MISSING: &str = "No ffmpeg found on the system!";
 
 fn ffmpeg_label(version: &str) -> String {
     let rest = version
