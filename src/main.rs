@@ -1,13 +1,14 @@
 //! VideoClipTrimmer — a small desktop window for cutting and joining video.
 //!
 //! The window is drawn with egui. The pixels come from miniquad (a real OS
-//! window, OpenGL, no browser). ffmpeg does the actual cutting and joining;
-//! see `ffmpeg.rs`.
+//! window, OpenGL, no browser). Playback is mpv when it is installed.
+//! ffmpeg does the cutting and joining.
 
 // Release builds are a GUI program. No console window, and no console output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ffmpeg;
+mod mpv;
 mod timeutil;
 mod ui;
 

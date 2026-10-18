@@ -15,6 +15,7 @@ egui-miniquad = "0.16"
 miniquad = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+libloading = "0.8"
 
 [profile.release]
 debug = false

@@ -12,6 +12,7 @@ use crate::ffmpeg::{
     PlayRequest, PlaySession, Segment, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab,
     spawn_hw_detect, spawn_play,
 };
+use crate::mpv::Player;
 use crate::timeutil::{format_time, parse_time};
 
 const MIN_RANGE: f64 = 0.05;
@@ -53,6 +54,9 @@ pub struct App {
     grab: Option<Receiver<Grabbed>>,
     grab_seq: u64,
     play: Option<PlaySession>,
+    /// Real player. When this is open, the preview is mpv, not grabbed frames.
+    film: Option<Player>,
+    mpv_warned: bool,
     job: Option<Job>,
     themed: bool,
     /// Shown once at startup when ffmpeg is not installed.
@@ -137,6 +141,8 @@ impl App {
             grab: None,
             grab_seq: 0,
             play: None,
+            film: None,
+            mpv_warned: false,
             job: None,
             themed: false,
             warn_ffmpeg,
@@ -149,11 +155,15 @@ impl App {
             || self.job.is_some()
             || self.wanted_time.is_some()
             || self.hw_detect.is_some()
+            || self.film.as_ref().is_some_and(Player::waiting)
     }
 
     /// How long to wait before the next frame. Idle windows wait on the OS instead.
     pub fn redraw_wait(&self) -> Duration {
-        if self.playing {
+        if self.playing && self.film.is_some() {
+            // mpv keeps the clock. We just sample it often enough to follow.
+            Duration::from_millis(8)
+        } else if self.playing {
             let fps = self
                 .media
                 .as_ref()
@@ -733,7 +743,98 @@ impl App {
         }
     }
 
+    fn pump_film(&mut self, ctx: &egui::Context) {
+        let (frame, time) = {
+            let Some(film) = self.film.as_mut() else {
+                return;
+            };
+            film.poll()
+        };
+        let showed = frame.is_some();
+        let clock = time;
+        if let Some(pixels) = frame {
+            let (width, height) = self
+                .film
+                .as_ref()
+                .map(|film| (film.width(), film.height()))
+                .unwrap_or((0, 0));
+            if width > 0 && height > 0 {
+                self.present_frame(ctx, &pixels, width, height, clock.unwrap_or(self.playhead));
+            }
+        }
+        let Some(time) = clock else {
+            return;
+        };
+        if !self.playing {
+            // A seek finished on this frame. Sit the cursor on mpv's clock.
+            if showed {
+                self.playhead = self.clamp_time(time);
+            }
+            return;
+        }
+        if time + 0.0005 >= self.out_point {
+            if self.loop_range {
+                self.playhead = self.in_point;
+                if let Some(film) = self.film.as_mut() {
+                    film.seek(self.in_point);
+                }
+            } else {
+                self.playing = false;
+                self.playhead = self.clamp_time(self.out_point);
+                if let Some(film) = self.film.as_mut() {
+                    film.set_paused(true);
+                }
+            }
+            return;
+        }
+        self.playhead = self.clamp_time(time);
+    }
+
+    fn clamp_time(&self, time: f64) -> f64 {
+        let duration = self.duration();
+        if duration > 0.0 {
+            time.clamp(0.0, duration)
+        } else {
+            time.max(0.0)
+        }
+    }
+
+    fn open_film(&mut self) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        let path = media.path.clone();
+        let (width, height) = ffmpeg::preview_size(media.info.width, media.info.height);
+        let hw = self.hw != HwAccel::Off;
+        let playhead = self.playhead;
+        self.film = None;
+        self.play = None;
+        match Player::open(&path, width, height, hw) {
+            Ok(mut player) => {
+                player.seek(playhead);
+                self.film = Some(player);
+                self.wanted_time = None;
+            }
+            Err(err) => {
+                self.film = None;
+                self.wanted_time = Some(playhead);
+                if !self.mpv_warned {
+                    self.mpv_warned = true;
+                    self.fail(err);
+                }
+            }
+        }
+    }
+
     fn pump_preview(&mut self, ctx: &egui::Context) {
+        let hw_on = self.hw != HwAccel::Off;
+        if self.film.as_ref().is_some_and(|film| film.hw_on() != hw_on) {
+            self.open_film();
+        }
+        if self.film.is_some() {
+            self.pump_film(ctx);
+            return;
+        }
         if self.playing {
             self.pump_play(ctx);
             return;
@@ -1005,8 +1106,9 @@ impl App {
                 self.write_time_fields();
                 self.playing = false;
                 self.play = None;
-                self.wanted_time = Some(self.playhead);
+                self.film = None;
                 self.notice = Notice::None;
+                self.open_film();
             }
             Err(err) => self.fail(err),
         }
@@ -1176,7 +1278,9 @@ impl App {
         }
         if self.playing {
             self.playing = false;
-            if let Some(play) = &self.play {
+            if let Some(film) = &mut self.film {
+                film.set_paused(true);
+            } else if let Some(play) = &self.play {
                 play.set_paused(true);
             }
             return;
@@ -1188,7 +1292,10 @@ impl App {
         }
         self.playing = true;
         self.wanted_time = None;
-        if let Some(play) = &self.play {
+        if let Some(film) = &mut self.film {
+            film.seek(self.playhead);
+            film.set_paused(false);
+        } else if let Some(play) = &self.play {
             play.set_paused(false);
         }
     }
@@ -1198,14 +1305,26 @@ impl App {
         self.play = None;
         let duration = self.duration();
         self.playhead = (self.playhead + delta).clamp(0.0, duration);
-        self.wanted_time = Some(self.playhead);
+        if let Some(film) = &mut self.film {
+            film.set_paused(true);
+            film.seek(self.playhead);
+            self.wanted_time = None;
+        } else {
+            self.wanted_time = Some(self.playhead);
+        }
     }
 
     fn seek(&mut self, time: f64) {
         self.playing = false;
         self.play = None;
         self.playhead = time.clamp(0.0, self.duration());
-        self.wanted_time = Some(self.playhead);
+        if let Some(film) = &mut self.film {
+            film.set_paused(true);
+            film.seek(self.playhead);
+            self.wanted_time = None;
+        } else {
+            self.wanted_time = Some(self.playhead);
+        }
     }
 
     fn apply_source_bitrates(&mut self, info: &MediaInfo) {
@@ -1235,9 +1354,9 @@ impl App {
                 save_hw(hw);
                 if hw != HwAccel::Off {
                     self.info(format!("Using {} hardware.", hw_label(hw)));
-                    if self.media.is_some() {
-                        self.wanted_time = Some(self.playhead);
-                    }
+                }
+                if self.media.is_some() {
+                    self.open_film();
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
