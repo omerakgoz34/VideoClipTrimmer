@@ -1069,6 +1069,23 @@ fn parse_showinfo_time(text: &str) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// Drops every frame before `start` and after `end`, then starts the file at 0.
+/// This is the same cut the preview uses, so the export opens on that picture.
+fn range_video_filter(start: f64, end: f64, rest: Option<String>) -> String {
+    let mut filter = format!("trim=start={start:.3}:end={end:.3},setpts=PTS-STARTPTS");
+    if let Some(rest) = rest {
+        if !rest.is_empty() {
+            filter.push(',');
+            filter.push_str(&rest);
+        }
+    }
+    filter
+}
+
+fn range_audio_filter(start: f64, end: f64) -> String {
+    format!("atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compatible_args(
     segment: &Segment,
@@ -1091,6 +1108,17 @@ fn compatible_args(
         "-loglevel".into(),
         "error".into(),
     ];
+    // Seek to the previous keyframe, but keep the original timestamps.
+    // `trim` below then throws away the frames before the one in the preview.
+    // Hardware decoders skip that step on their own, which is why a plain
+    // `-ss` starts the file on the wrong picture.
+    if segment.start > 0.001 {
+        args.extend([
+            "-copyts".into(),
+            "-ss".into(),
+            format!("{:.3}", segment.start),
+        ]);
+    }
     // `gpu` keeps Windows Intel frames on the encode engine. The other path
     // copies every frame back to memory, which only keeps the decode unit busy.
     let gpu = gpu && hw == HwAccel::Intel && cfg!(windows);
@@ -1099,14 +1127,7 @@ fn compatible_args(
     } else {
         args.extend(export_input_args(hw));
     }
-    args.extend([
-        // Input `-ss` is fast. ffmpeg then discards frames until this time,
-        // so the encoded cut starts on the same frame the preview showed.
-        "-ss".into(),
-        format!("{:.3}", segment.start),
-        "-i".into(),
-        segment.path.display().to_string(),
-    ]);
+    args.extend(["-i".into(), segment.path.display().to_string()]);
 
     if segment.has_audio {
         args.extend(["-map".into(), "0:v:0".into(), "-map".into(), "0:a:0".into()]);
@@ -1128,15 +1149,17 @@ fn compatible_args(
         args.extend(["-map".into(), "0:v:0".into()]);
     }
 
-    // Leave size, frame rate, and pixel format alone when they already match.
-    // A scale or fps filter resamples the picture even if the numbers look the same.
-    let filter = if gpu {
+    let rest = if gpu {
         Some(intel_gpu_filter(segment, target))
     } else {
         video_filter(segment, target, hw)
     };
-    if let Some(filter) = filter {
-        args.extend(["-vf".into(), filter]);
+    args.extend([
+        "-vf".into(),
+        range_video_filter(segment.start, segment.end, rest),
+    ]);
+    if segment.has_audio {
+        args.extend(["-af".into(), range_audio_filter(segment.start, segment.end)]);
     }
 
     if gpu {
@@ -2516,7 +2539,13 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             false,
             true,
         );
-        assert!(!args.iter().any(|arg| arg == "-vf" || arg == "-b:v"));
+        let cut = args
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .map(|pair| pair[1].as_str())
+            .unwrap();
+        assert_eq!(cut, "trim=start=0.000:end=1.000,setpts=PTS-STARTPTS");
+        assert!(!args.iter().any(|arg| arg == "-b:v"));
         assert!(args.windows(2).any(|pair| pair == ["-crf", "18"]));
         assert!(args.windows(2).any(|pair| pair == ["-b:a", "192k"]));
         assert!(args.iter().any(|arg| arg.contains("h264_metadata=")));
@@ -2694,6 +2723,128 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             joined.duration
         );
         assert_eq!((joined.width, joined.height), (160, 120));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn showinfo_checksum(output: &std::process::Output) -> String {
+        let text = String::from_utf8_lossy(&output.stderr);
+        text.split("checksum:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn export_opens_on_the_preview_frame() {
+        if !ffmpeg_ready() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("videocliptrimmer-frame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        // A keyframe every two seconds, so 1.5s is in the middle of a group.
+        let status = ffmpeg_cmd()
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=25:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=4",
+                "-c:v",
+                "libx264",
+                "-g",
+                "50",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not make the test video");
+
+        let preview = ffmpeg_cmd()
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-copyts",
+                "-ss",
+                "1.500",
+                "-i",
+            ])
+            .arg(&src)
+            .args([
+                "-an",
+                "-vf",
+                "trim=start=1.500,showinfo",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        let want = showinfo_checksum(&preview);
+        assert!(!want.is_empty(), "preview frame had no checksum");
+
+        let info = probe(&src).unwrap();
+        let segment = info.segment(src.clone(), 1.5, 3.0);
+        let settings = EncodeSettings {
+            video_crf: 0,
+            audio_bitrate: "160k".into(),
+            hw: HwAccel::Off,
+        };
+        let cancel = AtomicBool::new(false);
+        let hooks = Hooks {
+            progress: &|_| {},
+            log: &|line| eprintln!("{line}"),
+            cancel: &cancel,
+        };
+        for (mode, name) in [
+            (EncodeMode::Compatible, "re.mp4"),
+            (EncodeMode::FastCopy, "fast.mp4"),
+        ] {
+            let dest = dir.join(name);
+            export(
+                std::slice::from_ref(&segment),
+                &dest,
+                mode,
+                &settings,
+                &hooks,
+            )
+            .unwrap_or_else(|err| panic!("{name} export failed: {err}"));
+            let decoded = ffmpeg_cmd()
+                .args(["-hide_banner", "-loglevel", "info", "-i"])
+                .arg(&dest)
+                .args([
+                    "-an",
+                    "-vf",
+                    "showinfo",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            let got = showinfo_checksum(&decoded);
+            assert_eq!(got, want, "{name} did not open on the preview frame");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
