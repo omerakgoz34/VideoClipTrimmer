@@ -661,7 +661,7 @@ pub fn export(
         .map_err(|err| ExportError::Message(format!("Could not write the concat list: {err}")))?;
 
     let total: f64 = segments.iter().map(|s| s.end - s.start).sum();
-    let args = vec![
+    let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-nostats".into(),
@@ -677,10 +677,13 @@ pub fn export(
         list_path.display().to_string(),
         "-c".into(),
         "copy".into(),
+    ];
+    args.extend(shared_timescale());
+    args.extend([
         "-movflags".into(),
         "+faststart".into(),
         dest.display().to_string(),
-    ];
+    ]);
     run_with_progress(
         &args,
         &temp.0.join("progress.txt"),
@@ -803,7 +806,7 @@ fn encode_args(
 
 fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String> {
     let duration = segment.end - segment.start;
-    vec![
+    let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-nostats".into(),
@@ -827,8 +830,11 @@ fn fast_copy_args(segment: &Segment, dest: &Path, progress: &Path) -> Vec<String
         "make_zero".into(),
         "-movflags".into(),
         "+faststart".into(),
-        dest.display().to_string(),
-    ]
+    ];
+    // Keep the source speed. A later join reads this timescale.
+    args.extend(shared_timescale());
+    args.push(dest.display().to_string());
+    args
 }
 
 /// Stream copy starts on a keyframe. When the chosen frame is later than that,
@@ -1003,7 +1009,7 @@ fn concat_files(
         .join("\n");
     std::fs::write(&list_path, list + "\n")
         .map_err(|err| ExportError::Message(format!("Could not write the concat list: {err}")))?;
-    let args = vec![
+    let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-nostats".into(),
@@ -1019,10 +1025,13 @@ fn concat_files(
         list_path.display().to_string(),
         "-c".into(),
         "copy".into(),
+    ];
+    args.extend(shared_timescale());
+    args.extend([
         "-movflags".into(),
         "+faststart".into(),
         dest.display().to_string(),
-    ];
+    ]);
     run_with_progress(&args, &progress_path, 1.0, hooks, progress.0, progress.1)
 }
 
@@ -1078,6 +1087,16 @@ fn parse_showinfo_time(text: &str) -> Option<f64> {
         .collect();
     let value = number.parse::<f64>().ok()?;
     value.is_finite().then_some(value)
+}
+
+/// Every piece of a Fast Copy export uses this clock.
+///
+/// The opening is re-encoded and the rest is copied. ffmpeg gives the
+/// re-encoded piece its own timescale (often 12800). The copied piece keeps
+/// the source clock (often 90000 or 10 million). Joining those two makes the
+/// copied frames play in slow motion. One shared clock stops that.
+fn shared_timescale() -> [String; 2] {
+    ["-video_track_timescale".into(), "90000".into()]
 }
 
 /// Drops every frame before `start` and after `end`, then starts the file at 0.
@@ -1198,9 +1217,16 @@ fn compatible_args(
         // Quick Sync, VAAPI, and VideoToolbox never have to parse the name.
         args.extend(["-bsf:v".into(), filter]);
     }
+    // `passthrough` stops the encoder inventing a 25 fps clock. The shared
+    // timescale is what keeps a copied tail from playing in slow motion.
     args.extend([
+        "-fps_mode".into(),
+        "passthrough".into(),
         "-t".into(),
         format!("{:.3}", duration),
+    ]);
+    args.extend(shared_timescale());
+    args.extend([
         "-movflags".into(),
         "+faststart".into(),
         dest.display().to_string(),
@@ -2868,6 +2894,80 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             let got = showinfo_checksum(&decoded);
             assert_eq!(got, want, "{name} did not open on the preview frame");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_copy_keeps_real_time_on_a_high_timescale() {
+        if !ffmpeg_ready() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("videocliptrimmer-speed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        // Phone and Game Bar files often use a huge timescale. A keyframe
+        // every second, so the cut is not on a keyframe and Fast Copy joins
+        // a re-encoded opening to a copied tail.
+        let status = ffmpeg_cmd()
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=30:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=4",
+                "-c:v",
+                "libx264",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-video_track_timescale",
+                "10000000",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not make the test video");
+
+        let info = probe(&src).unwrap();
+        let segment = info.segment(src, 1.2, 3.5);
+        let dest = dir.join("fast.mp4");
+        let cancel = AtomicBool::new(false);
+        let hooks = Hooks {
+            progress: &|_| {},
+            log: &|_| {},
+            cancel: &cancel,
+        };
+        export(
+            std::slice::from_ref(&segment),
+            &dest,
+            EncodeMode::FastCopy,
+            &EncodeSettings {
+                video_crf: 18,
+                audio_bitrate: "128k".into(),
+                hw: HwAccel::Off,
+            },
+            &hooks,
+        )
+        .unwrap();
+        let out = probe(&dest).unwrap();
+        assert!(
+            (out.duration - 2.3).abs() < 0.6,
+            "fast copy stretched the clip to {}s",
+            out.duration
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
