@@ -17,16 +17,15 @@ use miniquad as mq;
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 fn main() {
-    // Sleep until the next click, unless playback or an export asks for another frame.
     let platform = mq::conf::Platform {
-        blocking_event_loop: true,
+        blocking_event_loop: false,
         linux_wm_class: "videocliptrimmer",
         ..Default::default()
     };
 
     let conf = mq::conf::Conf {
         window_title: format!("VideoClipTrimmer {VERSION}"),
-        window_width: 1280,
+        window_width: 1064,
         window_height: 720,
         high_dpi: true,
         fullscreen: false,
