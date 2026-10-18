@@ -335,7 +335,6 @@ pub enum PlayEvent {
 pub struct PlayRequest {
     pub path: PathBuf,
     pub start: f64,
-    pub fps: f64,
     pub width: u32,
     pub height: u32,
     pub hw: HwAccel,
@@ -434,11 +433,6 @@ fn play_decode(
     child_slot: &Mutex<Option<Child>>,
     tx: &mpsc::SyncSender<PlayEvent>,
 ) -> Result<(), String> {
-    let fps = if request.fps.is_finite() && (1.0..240.0).contains(&request.fps) {
-        request.fps
-    } else {
-        30.0
-    };
     let (width, height) = preview_size(request.width, request.height);
     if let Ok(mut slot) = child_slot.lock() {
         if let Some(child) = slot.as_mut() {
@@ -488,7 +482,8 @@ fn play_decode(
             match std::io::BufRead::read_line(&mut reader, &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if let Some(time) = parse_showinfo_time(&line)
+                    if line.contains("showinfo")
+                        && let Some(time) = parse_showinfo_time(&line)
                         && pts_tx.send(time).is_err()
                     {
                         break;
@@ -512,9 +507,7 @@ fn play_decode(
     let mut index = 0u64;
     let mut origin: Option<Instant> = None;
     let mut paused_for = Duration::ZERO;
-    let mut last_pts: Option<f64> = None;
-    let mut first_pts = request.start;
-    let mut frame_gap = 1.0 / fps;
+    let mut first_raw: Option<f64> = None;
     loop {
         if !block_while_paused(pause, stop, &mut paused_for) {
             return Ok(());
@@ -531,31 +524,28 @@ fn play_decode(
             let _ = tx.try_send(PlayEvent::Ended);
             return Ok(());
         }
-        // The picture's own timestamp. A guessed fps runs ahead of the frames
-        // and leaves the timeline cursor past the picture when playback stops.
-        let fallback = last_pts
-            .map(|prev| prev + frame_gap)
-            .unwrap_or(request.start);
-        let time = match pts_rx.recv_timeout(Duration::from_millis(50)) {
+        // One showinfo timestamp per picture. A timeout would leave that
+        // timestamp in the queue and stick it on a later frame, so the cursor
+        // falls behind the picture and never reaches the out point.
+        let raw = match pts_rx.recv() {
             Ok(stamp) => stamp,
-            Err(_) => fallback,
-        };
-        if let Some(prev) = last_pts {
-            let gap = time - prev;
-            if gap > 0.0 && gap < 0.5 {
-                frame_gap = gap;
+            Err(_) => {
+                let _ = tx.try_send(PlayEvent::Ended);
+                return Ok(());
             }
-        } else {
-            first_pts = time;
+        };
+        if first_raw.is_none() {
+            first_raw = Some(raw);
         }
-        last_pts = Some(time);
+        let first_raw = first_raw.unwrap_or(raw);
+        let time = playback_time(request.start, raw, first_raw);
         index += 1;
         if origin.is_none() {
-            // Start the clock when the first picture is ready, not while
-            // ffmpeg is still seeking. Otherwise the cursor races ahead.
             origin = Some(Instant::now());
         }
-        let due = Duration::from_secs_f64((time - first_pts).max(0.0));
+        let due = Duration::from_secs_f64(
+            (time - playback_time(request.start, first_raw, first_raw)).max(0.0),
+        );
         loop {
             if !block_while_paused(pause, stop, &mut paused_for) {
                 return Ok(());
@@ -1066,6 +1056,17 @@ fn next_keyframe(path: &Path, start: f64) -> Result<Option<f64>, ExportError> {
         .map_err(|err| ExportError::Message(format!("Could not look for a keyframe: {err}")))?;
     let text = String::from_utf8_lossy(&output.stderr);
     Ok(parse_showinfo_time(&text))
+}
+
+/// Hardware decoders sometimes restart timestamps at zero after a seek.
+/// Put those back on the timeline position playback started from. A normal
+/// absolute timestamp is left alone.
+fn playback_time(start: f64, raw: f64, first_raw: f64) -> f64 {
+    if start > 0.5 && first_raw < 0.5 {
+        start + (raw - first_raw)
+    } else {
+        raw
+    }
 }
 
 fn parse_showinfo_time(text: &str) -> Option<f64> {
@@ -2608,6 +2609,9 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert_eq!(videotoolbox_quality(51), 1);
         assert_eq!(parse_hw_name("NVIDIA"), Some(HwAccel::Nvidia));
         assert_eq!(hw_name(HwAccel::Intel), "intel");
+        assert!((playback_time(10.0, 0.00, 0.00) - 10.0).abs() < 0.001);
+        assert!((playback_time(10.0, 0.08, 0.00) - 10.08).abs() < 0.001);
+        assert!((playback_time(10.0, 10.08, 10.04) - 10.08).abs() < 0.001);
     }
 
     #[test]
@@ -2693,7 +2697,6 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         let session = spawn_play(PlayRequest {
             path: src.clone(),
             start: 0.0,
-            fps: info.fps,
             width: info.width,
             height: info.height,
             hw: HwAccel::Off,

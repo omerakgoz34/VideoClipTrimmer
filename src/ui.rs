@@ -30,9 +30,6 @@ pub struct App {
     in_edit: bool,
     out_edit: bool,
     playing: bool,
-    /// Playback finished on the out point. Keep the cursor there even if the
-    /// frame's own timestamp is a little earlier.
-    pin_playhead: bool,
     loop_range: bool,
     clips: Vec<Clip>,
     selected: Option<usize>,
@@ -118,7 +115,6 @@ impl App {
             in_edit: false,
             out_edit: false,
             playing: false,
-            pin_playhead: false,
             loop_range: false,
             clips: Vec::new(),
             selected: None,
@@ -418,7 +414,6 @@ impl App {
             self.out_point,
         ) {
             self.playing = false;
-            self.pin_playhead = false;
             self.play = None;
             self.playhead = time;
             self.wanted_time = Some(time);
@@ -766,7 +761,7 @@ impl App {
             match result {
                 Ok(frame) => {
                     self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
-                    if !self.playing && !self.pin_playhead {
+                    if !self.playing {
                         let duration = self.duration();
                         self.playhead = if duration > 0.0 {
                             time.clamp(0.0, duration)
@@ -774,7 +769,6 @@ impl App {
                             time.max(0.0)
                         };
                     }
-                    self.pin_playhead = false;
                 }
                 Err(err) => self.fail(format!("Preview: {err}")),
             }
@@ -819,7 +813,6 @@ impl App {
             return;
         };
         let path = media.path.clone();
-        let fps = media.info.fps;
         let width = media.info.width;
         let height = media.info.height;
         let hw = self.hw;
@@ -833,7 +826,6 @@ impl App {
             self.play = Some(spawn_play(PlayRequest {
                 path,
                 start: self.playhead,
-                fps,
                 width,
                 height,
                 hw,
@@ -876,13 +868,15 @@ impl App {
             if !self.play_using_cpu {
                 self.clear_hw_fallback_notice();
             }
-            if time >= self.out_point {
+            // The next picture is past the out point. Keep the frame that is
+            // already on screen, and leave the cursor on that frame.
+            if time > self.out_point + 0.0005 {
+                self.play = None;
                 if self.loop_range {
-                    self.play = None;
                     self.playhead = self.in_point;
                     self.shown_time = None;
                 } else {
-                    self.stop_on_out();
+                    self.playing = false;
                 }
                 return;
             }
@@ -896,26 +890,9 @@ impl App {
                 self.playhead = self.in_point;
                 self.shown_time = None;
             } else {
-                self.stop_on_out();
+                self.playing = false;
             }
         }
-    }
-
-    /// Playback reached the end of the selection. Put the cursor on the out
-    /// point and show the same frame a click there would show.
-    fn stop_on_out(&mut self) {
-        self.play = None;
-        self.playing = false;
-        let duration = self.duration();
-        let out = if duration > 0.0 {
-            self.out_point.clamp(0.0, duration)
-        } else {
-            self.out_point.max(0.0)
-        };
-        self.playhead = out;
-        self.pin_playhead = true;
-        self.shown_time = None;
-        self.wanted_time = Some(out);
     }
 
     fn present_frame(
@@ -1210,7 +1187,6 @@ impl App {
             self.shown_time = None;
         }
         self.playing = true;
-        self.pin_playhead = false;
         self.wanted_time = None;
         if let Some(play) = &self.play {
             play.set_paused(false);
@@ -1219,7 +1195,6 @@ impl App {
 
     fn nudge(&mut self, delta: f64) {
         self.playing = false;
-        self.pin_playhead = false;
         self.play = None;
         let duration = self.duration();
         self.playhead = (self.playhead + delta).clamp(0.0, duration);
@@ -1228,7 +1203,6 @@ impl App {
 
     fn seek(&mut self, time: f64) {
         self.playing = false;
-        self.pin_playhead = false;
         self.play = None;
         self.playhead = time.clamp(0.0, self.duration());
         self.wanted_time = Some(self.playhead);
