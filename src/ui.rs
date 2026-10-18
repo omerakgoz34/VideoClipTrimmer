@@ -1,16 +1,16 @@
 //! The window layout. State lives on `App`; drawing happens in `App::ui`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::ffmpeg::{
-    self, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab, spawn_hw_detect, spawn_play,
-    EncodeMode, EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, PlayEvent,
-    PlayRequest, PlaySession, Segment,
+    self, EncodeMode, EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, PlayEvent,
+    PlayRequest, PlaySession, Segment, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab,
+    spawn_hw_detect, spawn_play,
 };
 use crate::timeutil::{format_time, parse_time};
 
@@ -30,6 +30,9 @@ pub struct App {
     in_edit: bool,
     out_edit: bool,
     playing: bool,
+    /// Playback finished on the out point. Keep the cursor there even if the
+    /// frame's own timestamp is a little earlier.
+    pin_playhead: bool,
     loop_range: bool,
     clips: Vec<Clip>,
     selected: Option<usize>,
@@ -115,6 +118,7 @@ impl App {
             in_edit: false,
             out_edit: false,
             playing: false,
+            pin_playhead: false,
             loop_range: false,
             clips: Vec::new(),
             selected: None,
@@ -414,6 +418,7 @@ impl App {
             self.out_point,
         ) {
             self.playing = false;
+            self.pin_playhead = false;
             self.play = None;
             self.playhead = time;
             self.wanted_time = Some(time);
@@ -426,11 +431,11 @@ impl App {
                 has_media,
                 egui::TextEdit::singleline(&mut self.in_text).desired_width(96.0),
             );
-            if in_edit.changed() {
-                if let Some(time) = parse_time(&self.in_text) {
-                    self.in_point = time;
-                    self.clamp_range();
-                }
+            if in_edit.changed()
+                && let Some(time) = parse_time(&self.in_text)
+            {
+                self.in_point = time;
+                self.clamp_range();
             }
             self.in_edit = in_edit.has_focus();
             if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
@@ -448,11 +453,11 @@ impl App {
                 has_media,
                 egui::TextEdit::singleline(&mut self.out_text).desired_width(96.0),
             );
-            if out_edit.changed() {
-                if let Some(time) = parse_time(&self.out_text) {
-                    self.out_point = time;
-                    self.clamp_range();
-                }
+            if out_edit.changed()
+                && let Some(time) = parse_time(&self.out_text)
+            {
+                self.out_point = time;
+                self.clamp_range();
             }
             self.out_edit = out_edit.has_focus();
             if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
@@ -756,27 +761,27 @@ impl App {
             result,
             warning,
         }) = finished
+            && seq == self.grab_seq
         {
-            if seq == self.grab_seq {
-                match result {
-                    Ok(frame) => {
-                        self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
-                        if !self.playing {
-                            let duration = self.duration();
-                            self.playhead = if duration > 0.0 {
-                                time.clamp(0.0, duration)
-                            } else {
-                                time.max(0.0)
-                            };
-                        }
+            match result {
+                Ok(frame) => {
+                    self.present_frame(ctx, &frame.pixels, frame.width, frame.height, time);
+                    if !self.playing && !self.pin_playhead {
+                        let duration = self.duration();
+                        self.playhead = if duration > 0.0 {
+                            time.clamp(0.0, duration)
+                        } else {
+                            time.max(0.0)
+                        };
                     }
-                    Err(err) => self.fail(format!("Preview: {err}")),
+                    self.pin_playhead = false;
                 }
-                if let Some(warning) = warning {
-                    self.note_hw_fallback(&warning);
-                } else if self.hw != HwAccel::Off {
-                    self.clear_hw_fallback_notice();
-                }
+                Err(err) => self.fail(format!("Preview: {err}")),
+            }
+            if let Some(warning) = warning {
+                self.note_hw_fallback(&warning);
+            } else if self.hw != HwAccel::Off {
+                self.clear_hw_fallback_notice();
             }
         }
 
@@ -871,15 +876,13 @@ impl App {
             if !self.play_using_cpu {
                 self.clear_hw_fallback_notice();
             }
-            if time >= self.out_point - 0.02 {
-                self.play = None;
+            if time >= self.out_point {
                 if self.loop_range {
+                    self.play = None;
                     self.playhead = self.in_point;
                     self.shown_time = None;
                 } else {
-                    // Stay on the frame that is actually showing. Snapping to
-                    // the out point left the cursor ahead of that picture.
-                    self.playing = false;
+                    self.stop_on_out();
                 }
                 return;
             }
@@ -893,9 +896,26 @@ impl App {
                 self.playhead = self.in_point;
                 self.shown_time = None;
             } else {
-                self.playing = false;
+                self.stop_on_out();
             }
         }
+    }
+
+    /// Playback reached the end of the selection. Put the cursor on the out
+    /// point and show the same frame a click there would show.
+    fn stop_on_out(&mut self) {
+        self.play = None;
+        self.playing = false;
+        let duration = self.duration();
+        let out = if duration > 0.0 {
+            self.out_point.clamp(0.0, duration)
+        } else {
+            self.out_point.max(0.0)
+        };
+        self.playhead = out;
+        self.pin_playhead = true;
+        self.shown_time = None;
+        self.wanted_time = Some(out);
     }
 
     fn present_frame(
@@ -1190,6 +1210,7 @@ impl App {
             self.shown_time = None;
         }
         self.playing = true;
+        self.pin_playhead = false;
         self.wanted_time = None;
         if let Some(play) = &self.play {
             play.set_paused(false);
@@ -1198,6 +1219,7 @@ impl App {
 
     fn nudge(&mut self, delta: f64) {
         self.playing = false;
+        self.pin_playhead = false;
         self.play = None;
         let duration = self.duration();
         self.playhead = (self.playhead + delta).clamp(0.0, duration);
@@ -1206,6 +1228,7 @@ impl App {
 
     fn seek(&mut self, time: f64) {
         self.playing = false;
+        self.pin_playhead = false;
         self.play = None;
         self.playhead = time.clamp(0.0, self.duration());
         self.wanted_time = Some(self.playhead);
@@ -1353,13 +1376,13 @@ fn timeline(
         );
         painter.rect_filled(head, 0.0, rgb(0xec, 0xea, 0xe4));
     }
-    if response.clicked() || response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            if duration > 0.0 && rect.width() > 0.0 {
-                let fraction = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                return Some(fraction as f64 * duration);
-            }
-        }
+    if (response.clicked() || response.dragged())
+        && let Some(pos) = response.interact_pointer_pos()
+        && duration > 0.0
+        && rect.width() > 0.0
+    {
+        let fraction = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        return Some(fraction as f64 * duration);
     }
     None
 }

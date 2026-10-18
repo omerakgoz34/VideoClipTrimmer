@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -143,17 +143,17 @@ pub fn ffmpeg_program() -> String {
             return path.to_string();
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let name = if cfg!(windows) {
-                "ffmpeg.exe"
-            } else {
-                "ffmpeg"
-            };
-            let sibling = dir.join(name);
-            if sibling.is_file() {
-                return sibling.to_string_lossy().into_owned();
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let name = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        let sibling = dir.join(name);
+        if sibling.is_file() {
+            return sibling.to_string_lossy().into_owned();
         }
     }
     "ffmpeg".to_string()
@@ -355,11 +355,11 @@ impl PlaySession {
 impl Drop for PlaySession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut slot) = self.child.lock() {
-            if let Some(child) = slot.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Ok(mut slot) = self.child.lock()
+            && let Some(child) = slot.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -488,10 +488,10 @@ fn play_decode(
             match std::io::BufRead::read_line(&mut reader, &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if let Some(time) = parse_showinfo_time(&line) {
-                        if pts_tx.send(time).is_err() {
-                            break;
-                        }
+                    if let Some(time) = parse_showinfo_time(&line)
+                        && pts_tx.send(time).is_err()
+                    {
+                        break;
                     }
                     let mut buf = errors_worker.lock().unwrap();
                     buf.extend(line.as_bytes());
@@ -1083,11 +1083,11 @@ fn parse_showinfo_time(text: &str) -> Option<f64> {
 /// This is the same cut the preview uses, so the export opens on that picture.
 fn range_video_filter(start: f64, end: f64, rest: Option<String>) -> String {
     let mut filter = format!("trim=start={start:.3}:end={end:.3},setpts=PTS-STARTPTS");
-    if let Some(rest) = rest {
-        if !rest.is_empty() {
-            filter.push(',');
-            filter.push_str(&rest);
-        }
+    if let Some(rest) = rest
+        && !rest.is_empty()
+    {
+        filter.push(',');
+        filter.push_str(&rest);
     }
     filter
 }
@@ -2003,12 +2003,11 @@ fn last_out_time(text: &str) -> Option<f64> {
     let mut found = None;
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("out_time=") {
-            if rest != "N/A" {
-                if let Some(time) = parse_time(rest) {
-                    found = Some(time);
-                }
-            }
+        if let Some(rest) = line.strip_prefix("out_time=")
+            && rest != "N/A"
+            && let Some(time) = parse_time(rest)
+        {
+            found = Some(time);
         }
     }
     found
@@ -2223,12 +2222,12 @@ fn find_wxh(line: &str) -> Option<(u32, u32)> {
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
                 }
-                if j > hstart {
-                    if let Ok(height) = line[hstart..j].parse::<u32>() {
-                        if width >= 16 && height >= 16 {
-                            return Some((width, height));
-                        }
-                    }
+                if j > hstart
+                    && let Ok(height) = line[hstart..j].parse::<u32>()
+                    && width >= 16
+                    && height >= 16
+                {
+                    return Some((width, height));
                 }
             }
         } else {
@@ -2241,12 +2240,12 @@ fn find_wxh(line: &str) -> Option<(u32, u32)> {
 fn find_fps(line: &str) -> Option<f64> {
     for part in line.split(',') {
         let part = part.trim();
-        if let Some(num) = part.strip_suffix(" fps") {
-            if let Ok(value) = num.trim().parse::<f64>() {
-                if value > 0.0 && value < 1000.0 {
-                    return Some(value);
-                }
-            }
+        if let Some(num) = part.strip_suffix(" fps")
+            && let Ok(value) = num.trim().parse::<f64>()
+            && value > 0.0
+            && value < 1000.0
+        {
+            return Some(value);
         }
     }
     None
@@ -2508,14 +2507,16 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(filter.contains("video_full_range_flag=0"));
         assert!(!filter.contains("unknown"));
         assert!(!filter.contains('/'));
-        assert!(color_bitstream_filter(&Segment {
-            color_space: "unknown/bt709/iec61966-2-1".into(),
-            color_primaries: String::new(),
-            color_transfer: String::new(),
-            color_range: String::new(),
-            ..screen
-        })
-        .is_none());
+        assert!(
+            color_bitstream_filter(&Segment {
+                color_space: "unknown/bt709/iec61966-2-1".into(),
+                color_primaries: String::new(),
+                color_transfer: String::new(),
+                color_range: String::new(),
+                ..screen
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -2560,12 +2561,15 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(args.windows(2).any(|pair| pair == ["-b:a", "192k"]));
         assert!(args.iter().any(|arg| arg.contains("h264_metadata=")));
         assert!(args.iter().any(|arg| arg.contains("matrix_coefficients=1")));
-        assert!(args
-            .iter()
-            .any(|arg| arg.contains("transfer_characteristics=1")));
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "-colorspace" || arg == "-color_trc"));
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("transfer_characteristics=1"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-colorspace" || arg == "-color_trc")
+        );
         assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
 
         let nvidia = video_encoder_args(&segment, 18, HwAccel::Nvidia);
@@ -2573,9 +2577,11 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         assert!(nvidia.windows(2).any(|pair| pair == ["-b:v", "0"]));
         assert!(nvidia.windows(2).any(|pair| pair == ["-pix_fmt", "nv12"]));
         let intel = video_encoder_args(&segment, 18, HwAccel::Intel);
-        assert!(intel
-            .windows(2)
-            .any(|pair| pair == ["-global_quality", "18"]));
+        assert!(
+            intel
+                .windows(2)
+                .any(|pair| pair == ["-global_quality", "18"])
+        );
         assert!(!intel.iter().any(|arg| arg == "-pix_fmt"));
         assert_eq!(
             video_filter(&segment, &target, HwAccel::Intel).as_deref(),
@@ -2583,15 +2589,18 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         );
         let qsv = hw_decode_args(HwAccel::Intel);
         assert!(qsv.windows(2).any(|pair| pair == ["-hwaccel", "qsv"]));
-        assert!(qsv
-            .windows(2)
-            .any(|pair| pair == ["-hwaccel_output_format", "nv12"]));
+        assert!(
+            qsv.windows(2)
+                .any(|pair| pair == ["-hwaccel_output_format", "nv12"])
+        );
         assert!(!qsv.iter().any(|arg| arg.contains("init_hw_device")));
         let export = export_input_args(HwAccel::Intel);
         assert!(export.iter().any(|arg| arg.contains("qsv=hw")));
-        assert!(export
-            .windows(2)
-            .any(|pair| pair == ["-hwaccel_device", "hw"]));
+        assert!(
+            export
+                .windows(2)
+                .any(|pair| pair == ["-hwaccel_device", "hw"])
+        );
         assert_eq!(preview_size(1920, 1080), (960, 540));
         assert_eq!(preview_size(160, 120), (160, 120));
         assert_eq!(videotoolbox_quality(0), 100);
@@ -2605,9 +2614,10 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
     fn nvidia_decode_is_requested_when_that_encoder_is_on() {
         let args = hw_decode_args(HwAccel::Nvidia);
         assert!(args.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-hwaccel_output_format", "nv12"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-hwaccel_output_format", "nv12"])
+        );
         assert_eq!(normalize_bitrate("8M").unwrap(), "8M");
         assert_eq!(normalize_bitrate("192").unwrap(), "192k");
         assert!(normalize_bitrate("nope").is_err());
