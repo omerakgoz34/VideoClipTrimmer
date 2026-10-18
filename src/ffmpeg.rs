@@ -368,7 +368,7 @@ pub fn spawn_play(request: PlayRequest) -> PlaySession {
     let stop = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(AtomicBool::new(false));
     let child = Arc::new(Mutex::new(None));
-    let (tx, rx) = mpsc::sync_channel(2);
+    let (tx, rx) = mpsc::sync_channel(1);
     let stop_worker = Arc::clone(&stop);
     let pause_worker = Arc::clone(&pause);
     let child_worker = Arc::clone(&child);
@@ -512,6 +512,9 @@ fn play_decode(
     let mut index = 0u64;
     let mut origin: Option<Instant> = None;
     let mut paused_for = Duration::ZERO;
+    let mut last_pts: Option<f64> = None;
+    let mut first_pts = request.start;
+    let mut frame_gap = 1.0 / fps;
     loop {
         if !block_while_paused(pause, stop, &mut paused_for) {
             return Ok(());
@@ -528,15 +531,31 @@ fn play_decode(
             let _ = tx.try_send(PlayEvent::Ended);
             return Ok(());
         }
-        // The picture's own timestamp. Counting frames drifts off the cut points.
-        let time = pts_rx
-            .recv_timeout(Duration::from_millis(300))
-            .unwrap_or_else(|_| request.start + index as f64 / fps);
+        // The picture's own timestamp. A guessed fps runs ahead of the frames
+        // and leaves the timeline cursor past the picture when playback stops.
+        let fallback = last_pts
+            .map(|prev| prev + frame_gap)
+            .unwrap_or(request.start);
+        let time = match pts_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(stamp) => stamp,
+            Err(_) => fallback,
+        };
+        if let Some(prev) = last_pts {
+            let gap = time - prev;
+            if gap > 0.0 && gap < 0.5 {
+                frame_gap = gap;
+            }
+        } else {
+            first_pts = time;
+        }
+        last_pts = Some(time);
         index += 1;
         if origin.is_none() {
+            // Start the clock when the first picture is ready, not while
+            // ffmpeg is still seeking. Otherwise the cursor races ahead.
             origin = Some(Instant::now());
         }
-        let due = Duration::from_secs_f64((index - 1) as f64 / fps);
+        let due = Duration::from_secs_f64((time - first_pts).max(0.0));
         loop {
             if !block_while_paused(pause, stop, &mut paused_for) {
                 return Ok(());
@@ -551,24 +570,15 @@ fn play_decode(
             let left = due.saturating_sub(elapsed);
             thread::sleep(left.min(Duration::from_millis(8)));
         }
-        let elapsed = origin
-            .unwrap_or_else(Instant::now)
-            .elapsed()
-            .saturating_sub(paused_for);
-        if index > 1 && elapsed.saturating_sub(due) > Duration::from_secs_f64(1.5 / fps) {
-            // Behind realtime: drop the frame instead of queueing a slideshow.
-            // The first frame stays, so play starts on the same picture as a seek.
-            continue;
-        }
+        // One frame in the queue. A full queue means the window is behind, so
+        // wait instead of skipping ahead to a later timestamp.
         let frame = RgbaFrame {
             width,
             height,
             pixels: pixels.clone(),
         };
-        match tx.try_send(PlayEvent::Frame { time, frame }) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {}
-            Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+        if tx.send(PlayEvent::Frame { time, frame }).is_err() {
+            return Ok(());
         }
     }
 }

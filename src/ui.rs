@@ -206,10 +206,10 @@ impl App {
     pub fn ui(&mut self, ctx: &egui::Context) {
         self.ensure_theme(ctx);
         self.poll_hw_detect();
+        self.handle_keys(ctx);
         self.pump_preview(ctx);
         self.poll_job();
         self.sync_time_fields();
-        self.handle_keys(ctx);
 
         egui::TopBottomPanel::top("title").show(ctx, |ui| self.title_bar(ui));
 
@@ -840,11 +840,12 @@ impl App {
             let Some(play) = &self.play else {
                 return;
             };
-            let mut events = Vec::new();
-            while let Ok(event) = play.try_recv() {
-                events.push(event);
+            // One frame per refresh. Draining the queue showed a later
+            // timestamp than the picture that stayed on screen.
+            match play.try_recv() {
+                Ok(event) => vec![event],
+                Err(_) => Vec::new(),
             }
-            events
         };
         let mut frame = None;
         let mut ended = false;
@@ -876,7 +877,8 @@ impl App {
                     self.playhead = self.in_point;
                     self.shown_time = None;
                 } else {
-                    self.playhead = self.out_point.min(self.duration());
+                    // Stay on the frame that is actually showing. Snapping to
+                    // the out point left the cursor ahead of that picture.
                     self.playing = false;
                 }
                 return;
