@@ -448,7 +448,7 @@ impl App {
             ui.add_space(spare / 2.0);
             let start = ui.cursor().min.x;
 
-            if icon_button(ui, has_media, Icon::Back, "−1s", false).clicked() {
+            if icon_button(ui, has_media, Icon::Back, "1s", false).clicked() {
                 self.nudge(-1.0);
             }
             let (icon, play) = if self.playing {
@@ -459,7 +459,7 @@ impl App {
             if icon_button(ui, has_media, icon, play, false).clicked() {
                 self.toggle_play();
             }
-            if icon_button(ui, has_media, Icon::Forward, "+1s", false).clicked() {
+            if icon_button(ui, has_media, Icon::Forward, "1s", false).clicked() {
                 self.nudge(1.0);
             }
             ui.label(
