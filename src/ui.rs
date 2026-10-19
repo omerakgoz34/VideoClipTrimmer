@@ -424,10 +424,12 @@ impl App {
         }
 
         ui.horizontal(|ui| {
-            if icon_button(ui, true, Icon::Settings, "Settings", false).clicked() {
-                self.settings_open = true;
-            }
-            ui.label(self.encode_summary());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, true, Icon::Settings, "Settings", false).clicked() {
+                    self.settings_open = true;
+                }
+                ui.label(self.encode_summary());
+            });
         });
 
         ui.horizontal(|ui| {
