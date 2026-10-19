@@ -36,6 +36,8 @@ pub struct App {
     selected: Option<usize>,
     mode: EncodeMode,
     video_crf: i32,
+    /// One CRF for Off, NVIDIA, AMD, and Intel, in that order.
+    crf: [i32; 4],
     audio_bitrate: String,
     audio_bitrate_edited: bool,
     hw: HwAccel,
@@ -100,15 +102,17 @@ impl App {
     pub fn new() -> Self {
         let ffmpeg = check_ffmpeg();
         let warn_ffmpeg = ffmpeg.is_err();
-        let saved_hw = load_saved_hw();
-        let hw = saved_hw.unwrap_or(HwAccel::Off);
+        let saved = load_settings();
+        let hw = saved.hw.unwrap_or(HwAccel::Off);
         // A saved choice means this is not the first launch. Don't probe again.
-        let hw_touched = saved_hw.is_some();
+        let hw_touched = saved.hw.is_some();
         let hw_detect = if !hw_touched && ffmpeg.is_ok() {
             Some(spawn_hw_detect())
         } else {
             None
         };
+        let crf = saved.crf;
+        let video_crf = crf[hw_index(hw)];
         Self {
             ffmpeg,
             media: None,
@@ -124,7 +128,8 @@ impl App {
             clips: Vec::new(),
             selected: None,
             mode: EncodeMode::FastCopy,
-            video_crf: 18,
+            video_crf,
+            crf,
             audio_bitrate: "192k".to_string(),
             audio_bitrate_edited: false,
             hw,
@@ -562,7 +567,14 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Video quality");
                     ui.spacing_mut().slider_width = 180.0;
-                    ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
+                    let quality =
+                        ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
+                    ui.label(muted(&format!("for {}", hw_label(self.hw))));
+                    if quality.changed() {
+                        self.video_crf = self.video_crf.clamp(0, 51);
+                        self.crf[hw_index(self.hw)] = self.video_crf;
+                        self.persist();
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Audio bitrate");
@@ -617,10 +629,16 @@ impl App {
         self.clear_hw_fallback_notice();
         self.hw_touched = true;
         self.play = None;
-        save_hw(self.hw);
+        self.crf[hw_index(previous)] = self.video_crf.clamp(0, 51);
+        self.video_crf = self.crf[hw_index(self.hw)];
+        self.persist();
         if self.media.is_some() {
             self.wanted_time = Some(self.playhead);
         }
+    }
+
+    fn persist(&self) {
+        save_settings(self.hw, self.crf);
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -1411,9 +1429,11 @@ impl App {
                 if self.hw_touched {
                     return;
                 }
+                self.crf[hw_index(self.hw)] = self.video_crf.clamp(0, 51);
                 self.hw = hw;
+                self.video_crf = self.crf[hw_index(hw)];
                 self.hw_touched = true;
-                save_hw(hw);
+                self.persist();
                 if hw != HwAccel::Off {
                     self.info(format!("Using {} hardware.", hw_label(hw)));
                 }
@@ -1426,7 +1446,8 @@ impl App {
                 self.hw_detect = None;
                 if !self.hw_touched {
                     self.hw_touched = true;
-                    save_hw(HwAccel::Off);
+                    self.crf[hw_index(self.hw)] = self.video_crf.clamp(0, 51);
+                    self.persist();
                 }
             }
         }
@@ -1664,7 +1685,7 @@ fn hw_label(hw: HwAccel) -> &'static str {
     }
 }
 
-/// Remembers the hardware choice so the next launch does not probe again.
+/// Remembers the hardware choice and a CRF for each encoder.
 fn settings_path() -> Option<PathBuf> {
     let dir = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")
@@ -1684,24 +1705,84 @@ fn settings_path() -> Option<PathBuf> {
     Some(dir.join("settings.txt"))
 }
 
-fn load_saved_hw() -> Option<HwAccel> {
-    let text = std::fs::read_to_string(settings_path()?).ok()?;
-    for line in text.lines() {
-        if let Some(value) = line.trim().strip_prefix("hw=") {
-            return parse_hw_name(value);
-        }
-    }
-    None
+const DEFAULT_CRF: i32 = 18;
+
+struct SavedSettings {
+    hw: Option<HwAccel>,
+    crf: [i32; 4],
 }
 
-fn save_hw(hw: HwAccel) {
+fn hw_index(hw: HwAccel) -> usize {
+    match hw {
+        HwAccel::Off => 0,
+        HwAccel::Nvidia => 1,
+        HwAccel::Amd => 2,
+        HwAccel::Intel => 3,
+    }
+}
+
+fn crf_key(hw: HwAccel) -> &'static str {
+    match hw {
+        HwAccel::Off => "crf_off",
+        HwAccel::Nvidia => "crf_nvidia",
+        HwAccel::Amd => "crf_amd",
+        HwAccel::Intel => "crf_intel",
+    }
+}
+
+fn load_settings() -> SavedSettings {
+    let text = settings_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    parse_settings(&text)
+}
+
+fn parse_settings(text: &str) -> SavedSettings {
+    let mut saved = SavedSettings {
+        hw: None,
+        crf: [DEFAULT_CRF; 4],
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if key == "hw" {
+            saved.hw = parse_hw_name(value);
+            continue;
+        }
+        let Some(hw) = parse_crf_key(key) else {
+            continue;
+        };
+        if let Ok(crf) = value.parse::<i32>() {
+            saved.crf[hw_index(hw)] = crf.clamp(0, 51);
+        }
+    }
+    saved
+}
+
+fn parse_crf_key(key: &str) -> Option<HwAccel> {
+    match key {
+        "crf_off" => Some(HwAccel::Off),
+        "crf_nvidia" => Some(HwAccel::Nvidia),
+        "crf_amd" => Some(HwAccel::Amd),
+        "crf_intel" => Some(HwAccel::Intel),
+        _ => None,
+    }
+}
+
+fn save_settings(hw: HwAccel, crf: [i32; 4]) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, format!("hw={}\n", hw_name(hw)));
+    let mut text = format!("hw={}\n", hw_name(hw));
+    for choice in [HwAccel::Off, HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
+        text.push_str(&format!("{}={}\n", crf_key(choice), crf[hw_index(choice)]));
+    }
+    let _ = std::fs::write(path, text);
 }
 
 fn file_label(path: &Path) -> String {
@@ -1742,5 +1823,36 @@ fn ensure_mp4(path: PathBuf) -> PathBuf {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("mp4") => path,
         _ => path.with_extension("mp4"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_file_still_loads() {
+        let saved = parse_settings("hw=nvidia\n");
+        assert_eq!(saved.hw, Some(HwAccel::Nvidia));
+        assert_eq!(saved.crf, [DEFAULT_CRF; 4]);
+    }
+
+    #[test]
+    fn reads_a_crf_for_each_encoder() {
+        let saved =
+            parse_settings("hw=intel\ncrf_off=18\ncrf_nvidia=20\ncrf_amd=16\ncrf_intel=23\n");
+        assert_eq!(saved.hw, Some(HwAccel::Intel));
+        assert_eq!(saved.crf[hw_index(HwAccel::Off)], 18);
+        assert_eq!(saved.crf[hw_index(HwAccel::Nvidia)], 20);
+        assert_eq!(saved.crf[hw_index(HwAccel::Amd)], 16);
+        assert_eq!(saved.crf[hw_index(HwAccel::Intel)], 23);
+    }
+
+    #[test]
+    fn clamps_a_crf_and_ignores_junk() {
+        let saved = parse_settings("crf_intel=nope\ncrf_amd=80\ncrf_nvidia=-4\n");
+        assert_eq!(saved.crf[hw_index(HwAccel::Intel)], DEFAULT_CRF);
+        assert_eq!(saved.crf[hw_index(HwAccel::Amd)], 51);
+        assert_eq!(saved.crf[hw_index(HwAccel::Nvidia)], 0);
     }
 }
