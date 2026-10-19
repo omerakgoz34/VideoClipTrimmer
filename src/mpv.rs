@@ -341,6 +341,10 @@ impl Drop for Player {
     }
 }
 
+pub fn library_present() -> bool {
+    open_library().is_ok()
+}
+
 fn load_api() -> Result<Api, String> {
     let lib = open_library()?;
     Ok(Api {

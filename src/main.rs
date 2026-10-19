@@ -7,6 +7,7 @@
 // Release builds are a GUI program. No console window, and no console output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod drop_files;
 mod ffmpeg;
 mod mpv;
 mod timeutil;
@@ -72,6 +73,12 @@ impl mq::EventHandler for Stage {
     fn update(&mut self) {}
 
     fn draw(&mut self) {
+        drop_files::install();
+        let dropped = drop_files::take();
+        if !dropped.is_empty() {
+            self.app.open_paths(dropped);
+        }
+
         let Stage {
             egui_mq,
             mq_ctx,

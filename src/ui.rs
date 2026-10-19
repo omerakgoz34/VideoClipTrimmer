@@ -58,12 +58,15 @@ pub struct App {
     play: Option<PlaySession>,
     /// Real player. When this is open, the preview is mpv, not grabbed frames.
     film: Option<Player>,
+    mpv_ok: bool,
     mpv_warned: bool,
     settings_open: bool,
     job: Option<Job>,
     themed: bool,
     /// Shown once at startup when ffmpeg is not installed.
     warn_ffmpeg: bool,
+    /// Shown once at startup when the mpv library is not installed.
+    warn_mpv: bool,
 }
 
 struct Loaded {
@@ -102,6 +105,7 @@ impl App {
     pub fn new() -> Self {
         let ffmpeg = check_ffmpeg();
         let warn_ffmpeg = ffmpeg.is_err();
+        let mpv_ok = crate::mpv::library_present();
         let saved = load_settings();
         let hw = saved.hw.unwrap_or(HwAccel::Off);
         // A saved choice means this is not the first launch. Don't probe again.
@@ -148,11 +152,13 @@ impl App {
             grab_seq: 0,
             play: None,
             film: None,
+            mpv_ok,
             mpv_warned: false,
             settings_open: false,
             job: None,
             themed: false,
             warn_ffmpeg,
+            warn_mpv: !mpv_ok,
         }
     }
 
@@ -241,6 +247,7 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| self.stage(ui));
         self.settings_popup(ctx);
         self.ffmpeg_popup(ctx);
+        self.mpv_popup(ctx);
     }
 
     fn ensure_theme(&mut self, ctx: &egui::Context) {
@@ -297,9 +304,8 @@ impl App {
             if let Some(media) = &self.media {
                 ui.label(file_label(&media.path));
             }
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match &self.ffmpeg {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &self.ffmpeg {
                     Ok(version) => {
                         ui.label(muted(&ffmpeg_label(version)))
                             .on_hover_text(version);
@@ -307,8 +313,11 @@ impl App {
                     Err(_) => {
                         ui.colored_label(rgb(0xe0, 0x7a, 0x5f), FFMPEG_MISSING);
                     }
-                },
-            );
+                }
+                if !self.mpv_ok {
+                    ui.colored_label(rgb(0xe0, 0x7a, 0x5f), MPV_MISSING);
+                }
+            });
         });
     }
 
@@ -339,6 +348,34 @@ impl App {
         });
         if close {
             self.warn_ffmpeg = false;
+        }
+    }
+
+    fn mpv_popup(&mut self, ctx: &egui::Context) {
+        if !self.warn_mpv || self.warn_ffmpeg {
+            return;
+        }
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("mpv-missing")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(MPV_MISSING).color(rgb(0xe0, 0x7a, 0x5f)))
+                        .halign(egui::Align::Center),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new("Put libmpv next to the app, then open it again.")
+                        .halign(egui::Align::Center),
+                );
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.warn_mpv = false;
         }
     }
 
@@ -692,6 +729,10 @@ impl App {
         });
         ui.label(muted("The list is joined from top to bottom."));
         ui.add_space(4.0);
+        if icon_button(ui, true, Icon::Plus, "Add videos…", true).clicked() {
+            self.add_videos();
+        }
+        ui.add_space(4.0);
 
         let mut select = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -901,7 +942,10 @@ impl App {
             Err(err) => {
                 self.film = None;
                 self.wanted_time = Some(playhead);
-                if !self.mpv_warned {
+                if !self.mpv_ok || err.contains("not installed") {
+                    self.mpv_ok = false;
+                    self.warn_mpv = true;
+                } else if !self.mpv_warned {
                     self.mpv_warned = true;
                     self.fail(err);
                 }
@@ -1157,15 +1201,39 @@ impl App {
 
     fn browse_open(&mut self) {
         self.clear_armed = false;
-        let Some(paths) = rfd::FileDialog::new()
-            .set_title("Open video")
-            .add_filter("Video", VIDEO_EXT)
-            .add_filter("All files", &["*"])
-            .pick_files()
-        else {
+        let Some(paths) = pick_videos("Open video") else {
             return;
         };
         self.open_paths(paths);
+    }
+
+    fn add_videos(&mut self) {
+        self.clear_armed = false;
+        let Some(paths) = pick_videos("Add videos") else {
+            return;
+        };
+        let start = self.clips.len();
+        let mut failed = false;
+        for path in paths {
+            match ffmpeg::probe(&path) {
+                Ok(info) => self.clips.push(Clip::whole(path, info)),
+                Err(err) => {
+                    failed = true;
+                    self.fail(err);
+                }
+            }
+        }
+        let added = self.clips.len() - start;
+        if added == 0 {
+            return;
+        }
+        if self.media.is_none() {
+            self.select_clip(start);
+        }
+        if !failed {
+            let noun = if added == 1 { "clip" } else { "clips" };
+            self.info(format!("Added {added} {noun}."));
+        }
     }
 
     fn load_file(&mut self, path: PathBuf, keep: Option<(f64, f64)>) {
@@ -1656,6 +1724,15 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
 }
 
 const FFMPEG_MISSING: &str = "No ffmpeg found on the system!";
+const MPV_MISSING: &str = "No mpv library found on the system!";
+
+fn pick_videos(title: &str) -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Video", VIDEO_EXT)
+        .add_filter("All files", &["*"])
+        .pick_files()
+}
 
 fn ffmpeg_label(version: &str) -> String {
     let rest = version
