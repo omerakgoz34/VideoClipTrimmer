@@ -27,7 +27,7 @@ fn main() {
 
     let conf = mq::conf::Conf {
         window_title: format!("VideoClipTrimmer {VERSION}"),
-        window_width: 1064,
+        window_width: 1125,
         window_height: 720,
         high_dpi: true,
         fullscreen: false,
