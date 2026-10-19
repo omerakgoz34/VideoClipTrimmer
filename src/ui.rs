@@ -417,76 +417,27 @@ impl App {
             ui.checkbox(&mut self.loop_range, "Loop the range");
         });
 
+        if let Some(time) = timeline(
+            ui,
+            self.duration(),
+            self.playhead,
+            self.in_point,
+            self.out_point,
+        ) {
+            self.seek(time);
+            self.clear_armed = false;
+        }
+
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, true, Icon::Settings, "Settings", false).clicked() {
                     self.settings_open = true;
                 }
                 ui.label(self.encode_summary());
-                if let Some(time) = timeline(
-                    ui,
-                    self.duration(),
-                    self.playhead,
-                    self.in_point,
-                    self.out_point,
-                ) {
-                    self.seek(time);
-                    self.clear_armed = false;
-                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    self.range_controls(ui, has_media);
+                });
             });
-        });
-
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("In")
-                    .strong()
-                    .color(rgb(0x8f, 0xb8, 0xc4)),
-            );
-            let in_edit = ui.add_enabled(
-                has_media,
-                egui::TextEdit::singleline(&mut self.in_text).desired_width(96.0),
-            );
-            if in_edit.changed()
-                && let Some(time) = parse_time(&self.in_text)
-            {
-                self.in_point = time;
-                self.clamp_range();
-            }
-            self.in_edit = in_edit.has_focus();
-            if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
-                self.in_point = self.playhead;
-                self.clamp_range();
-                self.write_time_fields();
-            }
-            if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
-                self.seek(self.in_point);
-            }
-
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new("Out")
-                    .strong()
-                    .color(rgb(0x8f, 0xb8, 0xc4)),
-            );
-            let out_edit = ui.add_enabled(
-                has_media,
-                egui::TextEdit::singleline(&mut self.out_text).desired_width(96.0),
-            );
-            if out_edit.changed()
-                && let Some(time) = parse_time(&self.out_text)
-            {
-                self.out_point = time;
-                self.clamp_range();
-            }
-            self.out_edit = out_edit.has_focus();
-            if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
-                self.out_point = self.playhead;
-                self.clamp_range();
-                self.write_time_fields();
-            }
-            if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
-                self.seek(self.out_point);
-            }
         });
 
         ui.horizontal_wrapped(|ui| {
@@ -522,6 +473,59 @@ impl App {
             "Space play   ·   I / O set in and out   ·   arrows seek 1s, Shift 5s",
         ));
         ui.add_space(2.0);
+    }
+
+    fn range_controls(&mut self, ui: &mut egui::Ui, has_media: bool) {
+        ui.label(
+            egui::RichText::new("In")
+                .strong()
+                .color(rgb(0x8f, 0xb8, 0xc4)),
+        );
+        let in_edit = ui.add_enabled(
+            has_media,
+            egui::TextEdit::singleline(&mut self.in_text).desired_width(96.0),
+        );
+        if in_edit.changed()
+            && let Some(time) = parse_time(&self.in_text)
+        {
+            self.in_point = time;
+            self.clamp_range();
+        }
+        self.in_edit = in_edit.has_focus();
+        if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
+            self.in_point = self.playhead;
+            self.clamp_range();
+            self.write_time_fields();
+        }
+        if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
+            self.seek(self.in_point);
+        }
+
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("Out")
+                .strong()
+                .color(rgb(0x8f, 0xb8, 0xc4)),
+        );
+        let out_edit = ui.add_enabled(
+            has_media,
+            egui::TextEdit::singleline(&mut self.out_text).desired_width(96.0),
+        );
+        if out_edit.changed()
+            && let Some(time) = parse_time(&self.out_text)
+        {
+            self.out_point = time;
+            self.clamp_range();
+        }
+        self.out_edit = out_edit.has_focus();
+        if icon_button(ui, has_media, Icon::Mark, "Set", false).clicked() {
+            self.out_point = self.playhead;
+            self.clamp_range();
+            self.write_time_fields();
+        }
+        if icon_button(ui, has_media, Icon::Go, "Go", false).clicked() {
+            self.seek(self.out_point);
+        }
     }
 
     fn encode_summary(&self) -> egui::RichText {
