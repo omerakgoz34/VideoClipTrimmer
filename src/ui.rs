@@ -385,25 +385,38 @@ impl App {
             ui.add_space(4.0);
         }
 
+        let transport_h = 40.0;
         let size = ui.available_size();
+        let video_size = egui::vec2(size.x, (size.y - transport_h).max(80.0));
         let frame = egui::Frame::NONE
             .fill(rgb(0x10, 0x11, 0x14))
             .inner_margin(8.0)
             .corner_radius(6.0);
         frame.show(ui, |ui| {
-            ui.set_min_size((size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 80.0)));
+            ui.set_min_size((video_size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 80.0)));
             if self.media.is_none() {
                 self.empty_state(ui);
                 return;
             }
-            if let Some(tex) = &self.preview {
-                paint_fitted(ui, tex);
+            let clicked = if let Some(tex) = &self.preview {
+                paint_fitted(ui, tex).clicked()
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Reading a frame…");
-                });
+                let available = ui.available_size();
+                let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Reading a frame…",
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    ui.visuals().text_color(),
+                );
+                response.clicked()
+            };
+            if clicked {
+                self.toggle_play();
             }
         });
+        self.transport(ui);
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -423,12 +436,21 @@ impl App {
         });
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
+    fn transport(&mut self, ui: &mut egui::Ui) {
         let has_media = self.media.is_some();
-        let busy = self.job.is_some();
         ui.add_space(4.0);
-
         ui.horizontal(|ui| {
+            // Remember the row's width so it stays centered on the video,
+            // not on the wider window under the clip list.
+            let id = ui.id().with("transport-width");
+            let known = ui.data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
+            let spare = (ui.available_width() - known).max(0.0);
+            ui.add_space(spare / 2.0);
+            let start = ui.cursor().min.x;
+
+            if icon_button(ui, has_media, Icon::Back, "−1s", false).clicked() {
+                self.nudge(-1.0);
+            }
             let (icon, play) = if self.playing {
                 (Icon::Pause, "Pause")
             } else {
@@ -436,9 +458,6 @@ impl App {
             };
             if icon_button(ui, has_media, icon, play, false).clicked() {
                 self.toggle_play();
-            }
-            if icon_button(ui, has_media, Icon::Back, "−1s", false).clicked() {
-                self.nudge(-1.0);
             }
             if icon_button(ui, has_media, Icon::Forward, "+1s", false).clicked() {
                 self.nudge(1.0);
@@ -452,7 +471,16 @@ impl App {
                 .size(16.0),
             );
             ui.checkbox(&mut self.loop_range, "Loop the range");
+
+            let width = ui.cursor().min.x - start;
+            ui.data_mut(|data| data.insert_temp(id, width));
         });
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        let has_media = self.media.is_some();
+        let busy = self.job.is_some();
+        ui.add_space(4.0);
 
         if let Some(time) = timeline(
             ui,
@@ -1645,12 +1673,12 @@ fn timeline(
     None
 }
 
-fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) {
+fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response {
     let available = ui.available_size();
-    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
     let image = tex.size_vec2();
     if image.x < 1.0 || image.y < 1.0 || rect.width() < 1.0 || rect.height() < 1.0 {
-        return;
+        return response;
     }
     let scale = (rect.width() / image.x).min(rect.height() / image.y);
     let size = image * scale;
@@ -1658,6 +1686,7 @@ fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) {
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     ui.painter()
         .image(tex.id(), image_rect, uv, egui::Color32::WHITE);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[derive(Clone, Copy)]
