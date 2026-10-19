@@ -131,7 +131,7 @@ impl App {
             loop_range: false,
             clips: Vec::new(),
             selected: None,
-            mode: EncodeMode::FastCopy,
+            mode: saved.mode,
             video_crf,
             crf,
             audio_bitrate: "192k".to_string(),
@@ -589,10 +589,14 @@ impl App {
             ui.add_space(8.0);
 
             ui.label(egui::RichText::new("Export").strong());
+            let previous_mode = self.mode;
             ui.horizontal(|ui| {
                 ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast-Copy");
                 ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Re-Encode");
             });
+            if self.mode != previous_mode {
+                self.persist();
+            }
             ui.label(muted(match self.mode {
                 EncodeMode::FastCopy => {
                     "Copies the file and starts on the frame you set. A matching file is needed to join clips."
@@ -678,7 +682,7 @@ impl App {
     }
 
     fn persist(&self) {
-        save_settings(self.hw, self.crf);
+        save_settings(self.hw, self.crf, self.mode);
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -1626,16 +1630,6 @@ fn timeline(
             rect.y_range(),
             egui::Stroke::new(2.0_f32, rgb(0xec, 0xea, 0xe4)),
         );
-        let tip = [
-            egui::pos2(x, rect.top()),
-            egui::pos2(x - 6.0, rect.top() + 9.0),
-            egui::pos2(x + 6.0, rect.top() + 9.0),
-        ];
-        painter.add(egui::Shape::convex_polygon(
-            tip.to_vec(),
-            rgb(0xec, 0xea, 0xe4),
-            egui::Stroke::NONE,
-        ));
     }
     if (response.clicked() || response.dragged())
         && let Some(pos) = response.interact_pointer_pos()
@@ -1765,7 +1759,7 @@ fn hw_label(hw: HwAccel) -> &'static str {
     }
 }
 
-/// Remembers the hardware choice and a CRF for each encoder.
+/// Remembers the hardware choice, a CRF for each encoder, and Fast-Copy or Re-Encode.
 fn settings_path() -> Option<PathBuf> {
     let dir = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")
@@ -1790,6 +1784,7 @@ const DEFAULT_CRF: i32 = 18;
 struct SavedSettings {
     hw: Option<HwAccel>,
     crf: [i32; 4],
+    mode: EncodeMode,
 }
 
 fn hw_index(hw: HwAccel) -> usize {
@@ -1821,6 +1816,7 @@ fn parse_settings(text: &str) -> SavedSettings {
     let mut saved = SavedSettings {
         hw: None,
         crf: [DEFAULT_CRF; 4],
+        mode: EncodeMode::FastCopy,
     };
     for line in text.lines() {
         let Some((key, value)) = line.trim().split_once('=') else {
@@ -1829,6 +1825,12 @@ fn parse_settings(text: &str) -> SavedSettings {
         let value = value.trim();
         if key == "hw" {
             saved.hw = parse_hw_name(value);
+            continue;
+        }
+        if key == "mode" {
+            if let Some(mode) = parse_mode_name(value) {
+                saved.mode = mode;
+            }
             continue;
         }
         let Some(hw) = parse_crf_key(key) else {
@@ -1851,14 +1853,29 @@ fn parse_crf_key(key: &str) -> Option<HwAccel> {
     }
 }
 
-fn save_settings(hw: HwAccel, crf: [i32; 4]) {
+fn parse_mode_name(text: &str) -> Option<EncodeMode> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "fast" | "fastcopy" | "fast-copy" => Some(EncodeMode::FastCopy),
+        "reencode" | "re-encode" | "compatible" => Some(EncodeMode::Compatible),
+        _ => None,
+    }
+}
+
+fn mode_name(mode: EncodeMode) -> &'static str {
+    match mode {
+        EncodeMode::FastCopy => "fast",
+        EncodeMode::Compatible => "reencode",
+    }
+}
+
+fn save_settings(hw: HwAccel, crf: [i32; 4], mode: EncodeMode) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut text = format!("hw={}\n", hw_name(hw));
+    let mut text = format!("hw={}\nmode={}\n", hw_name(hw), mode_name(mode));
     for choice in [HwAccel::Off, HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
         text.push_str(&format!("{}={}\n", crf_key(choice), crf[hw_index(choice)]));
     }
@@ -1915,6 +1932,15 @@ mod tests {
         let saved = parse_settings("hw=nvidia\n");
         assert_eq!(saved.hw, Some(HwAccel::Nvidia));
         assert_eq!(saved.crf, [DEFAULT_CRF; 4]);
+        assert_eq!(saved.mode, EncodeMode::FastCopy);
+    }
+
+    #[test]
+    fn reads_the_saved_export_mode() {
+        let saved = parse_settings("mode=reencode\n");
+        assert_eq!(saved.mode, EncodeMode::Compatible);
+        let saved = parse_settings("mode=fast\n");
+        assert_eq!(saved.mode, EncodeMode::FastCopy);
     }
 
     #[test]
