@@ -417,23 +417,22 @@ impl App {
             ui.checkbox(&mut self.loop_range, "Loop the range");
         });
 
-        if let Some(time) = timeline(
-            ui,
-            self.duration(),
-            self.playhead,
-            self.in_point,
-            self.out_point,
-        ) {
-            self.seek(time);
-            self.clear_armed = false;
-        }
-
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, true, Icon::Settings, "Settings", false).clicked() {
                     self.settings_open = true;
                 }
                 ui.label(self.encode_summary());
+                if let Some(time) = timeline(
+                    ui,
+                    self.duration(),
+                    self.playhead,
+                    self.in_point,
+                    self.out_point,
+                ) {
+                    self.seek(time);
+                    self.clear_armed = false;
+                }
             });
         });
 
