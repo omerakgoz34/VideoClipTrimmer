@@ -599,10 +599,10 @@ impl App {
             }
             ui.label(muted(match self.mode {
                 EncodeMode::FastCopy => {
-                    "Keeps the original quality and finishes faster. The cut can miss the exact frame. Joined clips need to match."
+                    "Keeps the original quality and exports faster but the cut can miss the exact frame."
                 }
                 EncodeMode::Compatible => {
-                    "Lands on the exact frame. The picture is rebuilt, so it is a little softer and takes longer. Lower CRF keeps more detail."
+                    "Cuts on the exact frame but picture is rebuilt so it is lower quality and much slower. Lower CRF value means higher quality."
                 }
             }));
 
@@ -630,7 +630,7 @@ impl App {
                     if audio.changed() {
                         self.persist();
                     }
-                    ui.label(muted("auto uses the source"));
+                    ui.label(muted("'auto' uses the source. 128k, 256k, 320k etc."));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Frame rate");
@@ -642,7 +642,7 @@ impl App {
                     if fps.changed() {
                         self.persist();
                     }
-                    ui.label(muted("auto uses the source"));
+                    ui.label(muted("'auto' uses the source. 24, 30, 60 etc."));
                 });
             }
 
