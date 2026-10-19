@@ -385,38 +385,40 @@ impl App {
             ui.add_space(4.0);
         }
 
-        let transport_h = 40.0;
-        let size = ui.available_size();
-        let video_size = egui::vec2(size.x, (size.y - transport_h).max(80.0));
-        let frame = egui::Frame::NONE
-            .fill(rgb(0x10, 0x11, 0x14))
-            .inner_margin(8.0)
-            .corner_radius(6.0);
-        frame.show(ui, |ui| {
-            ui.set_min_size((video_size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 80.0)));
-            if self.media.is_none() {
-                self.empty_state(ui);
-                return;
-            }
-            let clicked = if let Some(tex) = &self.preview {
-                paint_fitted(ui, tex).clicked()
-            } else {
-                let available = ui.available_size();
-                let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Reading a frame…",
-                    egui::TextStyle::Body.resolve(ui.style()),
-                    ui.visuals().text_color(),
-                );
-                response.clicked()
-            };
-            if clicked {
-                self.toggle_play();
-            }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.transport(ui);
+            let size = ui.available_size();
+            let frame = egui::Frame::NONE
+                .fill(rgb(0x10, 0x11, 0x14))
+                .inner_margin(8.0)
+                .corner_radius(6.0);
+            frame.show(ui, |ui| {
+                let inner = (size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 80.0));
+                ui.set_min_size(inner);
+                ui.set_max_size(inner);
+                if self.media.is_none() {
+                    self.empty_state(ui);
+                    return;
+                }
+                let clicked = if let Some(tex) = &self.preview {
+                    paint_fitted(ui, tex).clicked()
+                } else {
+                    let available = ui.available_size();
+                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Reading a frame…",
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    );
+                    response.clicked()
+                };
+                if clicked {
+                    self.toggle_play();
+                }
+            });
         });
-        self.transport(ui);
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -778,80 +780,86 @@ impl App {
         }
         ui.add_space(4.0);
 
-        let mut select = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.clips.is_empty() {
-                ui.label(muted("Nothing here yet. Set in and out, then Add to list."));
-                return;
-            }
-            for (index, clip) in self.clips.iter().enumerate() {
-                let selected = self.selected == Some(index);
-                let title = format!("{}.  {}", index + 1, clip.label);
-                let meta = format!(
-                    "{}  –  {}     {}",
-                    format_time(clip.start),
-                    format_time(clip.end),
-                    format_time(clip.end - clip.start)
-                );
-                let mut button = egui::Button::new(format!("{title}\n{meta}"))
-                    .min_size(egui::vec2(ui.available_width(), 44.0));
-                if selected {
-                    button = button.fill(rgb(0x3d, 0x6a, 0x74));
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.path_opener(ui);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if self.clips.is_empty() {
+                    icon_button(ui, false, Icon::Clear, "Clear", false);
+                } else if self.clear_armed {
+                    if icon_button(ui, true, Icon::Clear, "Click again to clear", false).clicked() {
+                        self.clips.clear();
+                        self.selected = None;
+                        self.clear_armed = false;
+                    }
+                } else if icon_button(ui, true, Icon::Clear, "Clear", false).clicked() {
+                    self.clear_armed = true;
                 }
-                if ui
-                    .add(button)
-                    .on_hover_text(clip.path.display().to_string())
-                    .clicked()
+                let busy = self.job.is_some();
+                if icon_button(
+                    ui,
+                    !self.clips.is_empty() && !busy && self.ffmpeg.is_ok(),
+                    Icon::Export,
+                    "Export list…",
+                    true,
+                )
+                .clicked()
                 {
-                    select = Some(index);
+                    self.export_list();
                 }
-                ui.add_space(2.0);
-            }
-        });
-        if let Some(index) = select {
-            self.select_clip(index);
-        }
+            });
+            ui.horizontal(|ui| {
+                let has = self.selected.is_some();
+                if icon_button(ui, has, Icon::Up, "Up", false).clicked() {
+                    self.move_selected(-1);
+                }
+                if icon_button(ui, has, Icon::Down, "Down", false).clicked() {
+                    self.move_selected(1);
+                }
+                if icon_button(ui, has, Icon::Remove, "Remove", false).clicked() {
+                    self.remove_selected();
+                }
+            });
+            ui.add_space(6.0);
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let has = self.selected.is_some();
-            if icon_button(ui, has, Icon::Up, "Up", false).clicked() {
-                self.move_selected(-1);
-            }
-            if icon_button(ui, has, Icon::Down, "Down", false).clicked() {
-                self.move_selected(1);
-            }
-            if icon_button(ui, has, Icon::Remove, "Remove", false).clicked() {
-                self.remove_selected();
+            let mut select = None;
+            let list_h = ui.available_height().max(40.0);
+            egui::ScrollArea::vertical()
+                .max_height(list_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if self.clips.is_empty() {
+                        ui.label(muted("Nothing here yet. Set in and out, then Add to list."));
+                        return;
+                    }
+                    for (index, clip) in self.clips.iter().enumerate() {
+                        let selected = self.selected == Some(index);
+                        let title = format!("{}.  {}", index + 1, clip.label);
+                        let meta = format!(
+                            "{}  –  {}     {}",
+                            format_time(clip.start),
+                            format_time(clip.end),
+                            format_time(clip.end - clip.start)
+                        );
+                        let mut button = egui::Button::new(format!("{title}\n{meta}"))
+                            .min_size(egui::vec2(ui.available_width(), 44.0));
+                        if selected {
+                            button = button.fill(rgb(0x3d, 0x6a, 0x74));
+                        }
+                        if ui
+                            .add(button)
+                            .on_hover_text(clip.path.display().to_string())
+                            .clicked()
+                        {
+                            select = Some(index);
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+            if let Some(index) = select {
+                self.select_clip(index);
             }
         });
-        ui.horizontal(|ui| {
-            if self.clips.is_empty() {
-                icon_button(ui, false, Icon::Clear, "Clear", false);
-            } else if self.clear_armed {
-                if icon_button(ui, true, Icon::Clear, "Click again to clear", false).clicked() {
-                    self.clips.clear();
-                    self.selected = None;
-                    self.clear_armed = false;
-                }
-            } else if icon_button(ui, true, Icon::Clear, "Clear", false).clicked() {
-                self.clear_armed = true;
-            }
-            let busy = self.job.is_some();
-            if icon_button(
-                ui,
-                !self.clips.is_empty() && !busy && self.ffmpeg.is_ok(),
-                Icon::Export,
-                "Export list…",
-                true,
-            )
-            .clicked()
-            {
-                self.export_list();
-            }
-        });
-        ui.add_space(8.0);
-        self.path_opener(ui);
     }
 
     fn path_opener(&mut self, ui: &mut egui::Ui) {
