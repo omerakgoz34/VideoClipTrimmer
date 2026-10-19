@@ -57,6 +57,7 @@ pub struct App {
     /// Real player. When this is open, the preview is mpv, not grabbed frames.
     film: Option<Player>,
     mpv_warned: bool,
+    settings_open: bool,
     job: Option<Job>,
     themed: bool,
     /// Shown once at startup when ffmpeg is not installed.
@@ -143,6 +144,7 @@ impl App {
             play: None,
             film: None,
             mpv_warned: false,
+            settings_open: false,
             job: None,
             themed: false,
             warn_ffmpeg,
@@ -232,6 +234,7 @@ impl App {
             .show(ctx, |ui| self.clip_list(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| self.stage(ui));
+        self.settings_popup(ctx);
         self.ffmpeg_popup(ctx);
     }
 
@@ -269,9 +272,9 @@ impl App {
         visuals.faint_bg_color = rgb(0x22, 0x25, 0x2a);
         visuals.widgets.noninteractive.bg_fill = rgb(0x16, 0x18, 0x1c);
         visuals.widgets.noninteractive.fg_stroke.color = ink;
-        visuals.widgets.inactive.bg_fill = rgb(0x2a, 0x2e, 0x34);
+        visuals.widgets.inactive.bg_fill = rgb(0x2c, 0x31, 0x38);
         visuals.widgets.inactive.fg_stroke.color = ink;
-        visuals.widgets.hovered.bg_fill = rgb(0x36, 0x3c, 0x44);
+        visuals.widgets.hovered.bg_fill = rgb(0x3a, 0x42, 0x4a);
         visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
         visuals.widgets.active.bg_fill = rgb(0x3d, 0x6a, 0x74);
         visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
@@ -336,21 +339,17 @@ impl App {
 
     fn stage(&mut self, ui: &mut egui::Ui) {
         if let Some(media) = &self.media {
-            ui.label(muted(&summary(&media.info)));
+            ui.label(summary(&media.info));
             ui.add_space(4.0);
         }
 
-        let caption = if self.media.is_some() { 22.0 } else { 0.0 };
-        let size = egui::vec2(
-            ui.available_width(),
-            (ui.available_height() - caption).max(80.0),
-        );
+        let size = ui.available_size();
         let frame = egui::Frame::NONE
             .fill(rgb(0x10, 0x11, 0x14))
             .inner_margin(8.0)
             .corner_radius(6.0);
         frame.show(ui, |ui| {
-            ui.set_min_size((size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 40.0)));
+            ui.set_min_size((size - egui::vec2(16.0, 16.0)).max(egui::vec2(40.0, 80.0)));
             if self.media.is_none() {
                 self.empty_state(ui);
                 return;
@@ -363,12 +362,6 @@ impl App {
                 });
             }
         });
-        if self.media.is_some() {
-            ui.add_space(4.0);
-            ui.label(muted(
-                "Preview is picture only. The export keeps the audio.",
-            ));
-        }
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -408,11 +401,14 @@ impl App {
             if icon_button(ui, has_media, Icon::Forward, "+1s", false).clicked() {
                 self.nudge(1.0);
             }
-            ui.label(format!(
-                "{}   /   {}",
-                format_time(self.playhead),
-                format_time(self.duration())
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}    /    {}",
+                    format_time(self.playhead),
+                    format_time(self.duration())
+                ))
+                .size(16.0),
+            );
             ui.checkbox(&mut self.loop_range, "Loop the range");
         });
 
@@ -423,15 +419,23 @@ impl App {
             self.in_point,
             self.out_point,
         ) {
-            self.playing = false;
-            self.play = None;
-            self.playhead = time;
-            self.wanted_time = Some(time);
+            self.seek(time);
             self.clear_armed = false;
         }
 
         ui.horizontal(|ui| {
-            ui.label("In");
+            if icon_button(ui, true, Icon::Settings, "Settings", false).clicked() {
+                self.settings_open = true;
+            }
+            ui.label(self.encode_summary());
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("In")
+                    .strong()
+                    .color(rgb(0x8f, 0xb8, 0xc4)),
+            );
             let in_edit = ui.add_enabled(
                 has_media,
                 egui::TextEdit::singleline(&mut self.in_text).desired_width(96.0),
@@ -452,8 +456,12 @@ impl App {
                 self.seek(self.in_point);
             }
 
-            ui.add_space(12.0);
-            ui.label("Out");
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new("Out")
+                    .strong()
+                    .color(rgb(0x8f, 0xb8, 0xc4)),
+            );
             let out_edit = ui.add_enabled(
                 has_media,
                 egui::TextEdit::singleline(&mut self.out_text).desired_width(96.0),
@@ -501,64 +509,116 @@ impl App {
             {
                 self.export_current();
             }
-            ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Re-Encode");
-            ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast-Copy");
         });
-        if self.mode == EncodeMode::Compatible {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Video quality");
-                ui.spacing_mut().slider_width = 150.0;
-                ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
-                ui.label(muted("lower keeps more detail"));
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Audio bitrate");
-                let audio = ui.add(
-                    egui::TextEdit::singleline(&mut self.audio_bitrate)
-                        .desired_width(72.0)
-                        .hint_text("192k"),
-                );
-                if audio.changed() {
-                    self.audio_bitrate_edited = true;
-                }
-                ui.label(muted("192k or 2M"));
-            });
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Hardware");
-            let previous = self.hw;
-            ui.radio_value(&mut self.hw, HwAccel::Off, "Off");
-            ui.radio_value(&mut self.hw, HwAccel::Nvidia, "NVIDIA");
-            ui.radio_value(&mut self.hw, HwAccel::Amd, amd_button_label());
-            ui.radio_value(&mut self.hw, HwAccel::Intel, "Intel");
-            if self.hw != previous {
-                self.hw_warned = false;
-                self.clear_hw_fallback_notice();
-                self.hw_touched = true;
-                self.play = None;
-                save_hw(self.hw);
-                if self.media.is_some() {
-                    self.wanted_time = Some(self.playhead);
-                }
-            }
-            if self.hw_detect.is_some() {
-                ui.label(muted("checking…"));
-            }
-        });
-        ui.label(muted(match self.mode {
-            EncodeMode::Compatible => {
-                "Re-encodes at the CRF above. Lower keeps more of the picture. Size, frame rate, and color tags stay as they are, unless clips must be matched to the first one. Hardware also decodes the preview."
-            }
-            EncodeMode::FastCopy => {
-                "Copies the file. The cut starts on the frame you set, re-encoding only up to the next keyframe when it has to. Joins need matching files. Hardware still decodes the preview when it is on."
-            }
-        }));
 
         self.status_line(ui);
         ui.label(muted(
             "Space play   ·   I / O set in and out   ·   arrows seek 1s, Shift 5s",
         ));
         ui.add_space(2.0);
+    }
+
+    fn encode_summary(&self) -> egui::RichText {
+        let mode = match self.mode {
+            EncodeMode::FastCopy => "Fast-Copy".to_string(),
+            EncodeMode::Compatible => format!("Re-Encode · CRF {}", self.video_crf),
+        };
+        let text = if self.hw_detect.is_some() {
+            format!("{mode} · checking hardware…")
+        } else {
+            format!("{mode} · {}", hw_label(self.hw))
+        };
+        muted(&text)
+    }
+
+    fn settings_popup(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("encode-settings")).show(ctx, |ui| {
+            ui.set_min_width(440.0);
+            ui.heading("Settings");
+            ui.add_space(8.0);
+
+            ui.label(egui::RichText::new("Export").strong());
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.mode, EncodeMode::FastCopy, "Fast-Copy");
+                ui.radio_value(&mut self.mode, EncodeMode::Compatible, "Re-Encode");
+            });
+            ui.label(muted(match self.mode {
+                EncodeMode::FastCopy => {
+                    "Copies the file and starts on the frame you set. A matching file is needed to join clips."
+                }
+                EncodeMode::Compatible => {
+                    "Rebuilds the picture at the quality below. Lower CRF keeps more detail."
+                }
+            }));
+
+            if self.mode == EncodeMode::Compatible {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Video quality");
+                    ui.spacing_mut().slider_width = 180.0;
+                    ui.add(egui::Slider::new(&mut self.video_crf, 0..=51).text("CRF"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Audio bitrate");
+                    let audio = ui.add(
+                        egui::TextEdit::singleline(&mut self.audio_bitrate)
+                            .desired_width(80.0)
+                            .hint_text("192k"),
+                    );
+                    if audio.changed() {
+                        self.audio_bitrate_edited = true;
+                    }
+                    ui.label(muted("192k or 2M"));
+                });
+            }
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Hardware").strong());
+            ui.label(muted(
+                "Plays the preview, and encodes when Re-Encode is selected.",
+            ));
+            let previous = self.hw;
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut self.hw, HwAccel::Off, "Off");
+                ui.radio_value(&mut self.hw, HwAccel::Nvidia, "NVIDIA");
+                ui.radio_value(&mut self.hw, HwAccel::Amd, amd_button_label());
+                ui.radio_value(&mut self.hw, HwAccel::Intel, "Intel");
+                if self.hw_detect.is_some() {
+                    ui.label(muted("checking…"));
+                }
+            });
+            if self.hw != previous {
+                self.apply_hw(previous);
+            }
+
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || response.should_close() {
+            self.settings_open = false;
+        }
+    }
+
+    fn apply_hw(&mut self, previous: HwAccel) {
+        if self.hw == previous {
+            return;
+        }
+        self.hw_warned = false;
+        self.clear_hw_fallback_notice();
+        self.hw_touched = true;
+        self.play = None;
+        save_hw(self.hw);
+        if self.media.is_some() {
+            self.wanted_time = Some(self.playhead);
+        }
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -1452,9 +1512,9 @@ fn timeline(
 ) -> Option<f64> {
     let width = ui.available_width();
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click_and_drag());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, rgb(0x10, 0x11, 0x14));
+    painter.rect_filled(rect, 5.0, rgb(0x10, 0x11, 0x14));
     if duration > 0.0 {
         let x_at =
             |time: f64| rect.left() + rect.width() * (time / duration).clamp(0.0, 1.0) as f32;
@@ -1462,12 +1522,26 @@ fn timeline(
             egui::pos2(x_at(in_point), rect.top()),
             egui::pos2(x_at(out_point), rect.bottom()),
         );
-        painter.rect_filled(range, 4.0, rgb(0x3d, 0x6a, 0x74));
-        let head = egui::Rect::from_center_size(
-            egui::pos2(x_at(playhead), rect.center().y),
-            egui::vec2(2.0, rect.height()),
+        painter.rect_filled(range, 5.0, rgb(0x3d, 0x6a, 0x74));
+        let edge = egui::Stroke::new(2.0_f32, rgb(0xd8, 0xd0, 0xc4));
+        painter.vline(x_at(in_point), rect.y_range(), edge);
+        painter.vline(x_at(out_point), rect.y_range(), edge);
+        let x = x_at(playhead);
+        painter.vline(
+            x,
+            rect.y_range(),
+            egui::Stroke::new(2.0_f32, rgb(0xec, 0xea, 0xe4)),
         );
-        painter.rect_filled(head, 0.0, rgb(0xec, 0xea, 0xe4));
+        let tip = [
+            egui::pos2(x, rect.top()),
+            egui::pos2(x - 6.0, rect.top() + 9.0),
+            egui::pos2(x + 6.0, rect.top() + 9.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            tip.to_vec(),
+            rgb(0xec, 0xea, 0xe4),
+            egui::Stroke::NONE,
+        ));
     }
     if (response.clicked() || response.dragged())
         && let Some(pos) = response.interact_pointer_pos()
@@ -1511,6 +1585,7 @@ enum Icon {
     Remove,
     Clear,
     Folder,
+    Settings,
 }
 
 fn icon_button(
@@ -1535,6 +1610,7 @@ fn icon_button(
         Icon::Remove => "🗑",
         Icon::Clear => "🧹",
         Icon::Folder => "📂",
+        Icon::Settings => "⚙",
     };
     let mut button = egui::Button::new(format!("{mark}  {label}"));
     if accent {
@@ -1545,8 +1621,8 @@ fn icon_button(
 
 fn muted(text: &str) -> egui::RichText {
     egui::RichText::new(text)
-        .color(rgb(0x9c, 0x98, 0x90))
-        .size(12.5)
+        .color(rgb(0xc4, 0xc0, 0xb6))
+        .size(13.0)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
