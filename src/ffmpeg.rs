@@ -37,11 +37,13 @@ pub enum HwAccel {
 /// Quality and audio rate used when `EncodeMode::Compatible` re-encodes.
 ///
 /// `video_crf` is 0–51, same scale as x264. Lower keeps more of the picture.
-/// `audio_bitrate` is an ffmpeg rate such as `192k`.
+/// `audio_bitrate` is `auto` or an ffmpeg rate such as `192k`.
+/// `fps` is `auto` or a number such as `30`.
 #[derive(Clone, Debug)]
 pub struct EncodeSettings {
     pub video_crf: i32,
     pub audio_bitrate: String,
+    pub fps: String,
     pub hw: HwAccel,
 }
 
@@ -81,7 +83,8 @@ pub struct Segment {
     pub color_space: String,
     pub color_primaries: String,
     pub color_transfer: String,
-    /// Empty when the probe did not name the codec.
+    /// Bits per second, when the probe printed an audio bitrate.
+    pub audio_bitrate: Option<u64>,
     pub video_codec: String,
     pub audio_codec: String,
 }
@@ -101,6 +104,7 @@ impl MediaInfo {
             color_space: self.color_space.clone(),
             color_primaries: self.color_primaries.clone(),
             color_transfer: self.color_transfer.clone(),
+            audio_bitrate: self.audio_bitrate,
             video_codec: self.video_codec.clone(),
             audio_codec: self.audio_codec.clone(),
         }
@@ -779,20 +783,21 @@ fn encode_args(
         EncodeMode::FastCopy => fast_copy_args(segment, dest, progress_path),
         EncodeMode::Compatible => {
             let crf = settings.video_crf.clamp(0, 51);
-            let audio_bitrate = normalize_bitrate(&settings.audio_bitrate)
+            let audio_bitrate = resolve_audio_bitrate(&settings.audio_bitrate, segment)
                 .map_err(|err| ExportError::Message(format!("Audio bitrate: {err}")))?;
-            let owned;
-            let target = match target {
-                Some(target) => target,
-                None => {
-                    owned = output_target(segment);
-                    &owned
-                }
+            let mut target = match target {
+                Some(target) => *target,
+                None => output_target(segment),
             };
+            if let Some(fps) = parse_fps_setting(&settings.fps)
+                .map_err(|err| ExportError::Message(format!("Frame rate: {err}")))?
+            {
+                target.fps = fps;
+            }
             compatible_args(
                 segment,
                 dest,
-                target,
+                &target,
                 progress_path,
                 crf,
                 &audio_bitrate,
@@ -1737,6 +1742,7 @@ fn probe_segment() -> Segment {
         color_transfer: String::new(),
         video_codec: String::new(),
         audio_codec: String::new(),
+        audio_bitrate: None,
     }
 }
 
@@ -1881,6 +1887,42 @@ fn usable_color(name: &str) -> Option<String> {
     }
 }
 
+/// `auto` keeps the source frame rate. Anything else is a number, such as `30` or `29.97`.
+pub fn parse_fps_setting(text: &str) -> Result<Option<f64>, String> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let number = text
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim();
+    let value = number
+        .parse::<f64>()
+        .map_err(|_| format!("'{text}' is not a frame rate. Use auto or 30."))?;
+    if value.is_finite() && (1.0..=240.0).contains(&value) {
+        Ok(Some(value))
+    } else {
+        Err(format!(
+            "'{text}' is not a frame rate. Use a number from 1 to 240."
+        ))
+    }
+}
+
+/// `auto` uses the bitrate probed from this clip. A missing probe falls back to 192k.
+pub fn resolve_audio_bitrate(text: &str, segment: &Segment) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("auto") {
+        let bits = segment.audio_bitrate.unwrap_or(192_000);
+        return Ok(bitrate_from_bps(bits));
+    }
+    normalize_bitrate(text)
+}
+
+fn bitrate_from_bps(bits: u64) -> String {
+    let kbps = ((bits as f64) / 1000.0).round() as u64;
+    format!("{}k", kbps.max(1))
+}
+
 /// `8000k` or `8M`, or a plain number of kilobits (`192` → `192k`).
 ///
 /// `M` stays uppercase. ffmpeg treats `m` as milli, which is not a useful bitrate.
@@ -1906,6 +1948,7 @@ pub fn normalize_bitrate(text: &str) -> Result<String, String> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Target {
     width: u32,
     height: u32,
@@ -2479,6 +2522,22 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
     }
 
     #[test]
+    fn auto_uses_the_source_bitrate_and_frame_rate() {
+        let segment = Segment {
+            audio_bitrate: Some(256_000),
+            fps: 24.0,
+            ..probe_segment()
+        };
+        assert_eq!(resolve_audio_bitrate("auto", &segment).unwrap(), "256k");
+        assert_eq!(resolve_audio_bitrate("192k", &segment).unwrap(), "192k");
+        assert_eq!(parse_fps_setting("auto").unwrap(), None);
+        assert_eq!(parse_fps_setting("30").unwrap(), Some(30.0));
+        let fps = parse_fps_setting("29.97").unwrap().unwrap();
+        assert!((fps - 29.97).abs() < 0.001);
+        assert!(parse_fps_setting("nope").is_err());
+    }
+
+    #[test]
     fn fast_copy_keeps_the_streams() {
         let segment = Segment {
             path: PathBuf::from("clip.mp4"),
@@ -2495,6 +2554,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             color_transfer: "bt709".into(),
             video_codec: "h264".into(),
             audio_codec: "aac".into(),
+            audio_bitrate: None,
         };
         let args = fast_copy_args(&segment, Path::new("out.mp4"), Path::new("p.txt"));
         assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
@@ -2563,6 +2623,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             color_transfer: "bt709".into(),
             video_codec: "h264".into(),
             audio_codec: "aac".into(),
+            audio_bitrate: None,
         };
         let target = output_target(&segment);
         assert!(video_filter(&segment, &target, HwAccel::Off).is_none());
@@ -2755,6 +2816,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         let settings = EncodeSettings {
             video_crf: 18,
             audio_bitrate: "160k".into(),
+            fps: "auto".into(),
             hw: HwAccel::Off,
         };
         export(
@@ -2855,6 +2917,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
         let settings = EncodeSettings {
             video_crf: 0,
             audio_bitrate: "160k".into(),
+            fps: "auto".into(),
             hw: HwAccel::Off,
         };
         let cancel = AtomicBool::new(false);
@@ -2957,6 +3020,7 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
             &EncodeSettings {
                 video_crf: 18,
                 audio_bitrate: "128k".into(),
+                fps: "auto".into(),
                 hw: HwAccel::Off,
             },
             &hooks,

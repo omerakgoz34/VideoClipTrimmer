@@ -39,7 +39,7 @@ pub struct App {
     /// One CRF for Off, NVIDIA, AMD, and Intel, in that order.
     crf: [i32; 4],
     audio_bitrate: String,
-    audio_bitrate_edited: bool,
+    fps: String,
     hw: HwAccel,
     hw_touched: bool,
     hw_detect: Option<Receiver<HwAccel>>,
@@ -134,8 +134,8 @@ impl App {
             mode: saved.mode,
             video_crf,
             crf,
-            audio_bitrate: "192k".to_string(),
-            audio_bitrate_edited: false,
+            audio_bitrate: saved.audio,
+            fps: saved.fps,
             hw,
             hw_touched,
             hw_detect,
@@ -599,10 +599,10 @@ impl App {
             }
             ui.label(muted(match self.mode {
                 EncodeMode::FastCopy => {
-                    "Copies the file and starts on the frame you set. A matching file is needed to join clips."
+                    "Keeps the original quality and finishes faster. The cut can miss the exact frame. Joined clips need to match."
                 }
                 EncodeMode::Compatible => {
-                    "Rebuilds the picture at the quality below. Lower CRF keeps more detail."
+                    "Lands on the exact frame. The picture is rebuilt, so it is a little softer and takes longer. Lower CRF keeps more detail."
                 }
             }));
 
@@ -625,12 +625,24 @@ impl App {
                     let audio = ui.add(
                         egui::TextEdit::singleline(&mut self.audio_bitrate)
                             .desired_width(80.0)
-                            .hint_text("192k"),
+                            .hint_text("auto"),
                     );
                     if audio.changed() {
-                        self.audio_bitrate_edited = true;
+                        self.persist();
                     }
-                    ui.label(muted("192k or 2M"));
+                    ui.label(muted("auto uses the source"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Frame rate");
+                    let fps = ui.add(
+                        egui::TextEdit::singleline(&mut self.fps)
+                            .desired_width(80.0)
+                            .hint_text("auto"),
+                    );
+                    if fps.changed() {
+                        self.persist();
+                    }
+                    ui.label(muted("auto uses the source"));
                 });
             }
 
@@ -682,7 +694,7 @@ impl App {
     }
 
     fn persist(&self) {
-        save_settings(self.hw, self.crf, self.mode);
+        save_settings(self.hw, self.crf, self.mode, &self.audio_bitrate, &self.fps);
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -1244,7 +1256,6 @@ impl App {
         match ffmpeg::probe(&path) {
             Ok(info) => {
                 let duration = info.duration;
-                self.apply_source_bitrates(&info);
                 self.media = Some(Loaded { path, info });
                 self.preview = None;
                 self.shown_time = None;
@@ -1395,6 +1406,7 @@ impl App {
         let settings = EncodeSettings {
             video_crf: self.video_crf,
             audio_bitrate: self.audio_bitrate.clone(),
+            fps: self.fps.clone(),
             hw: self.hw,
         };
         let (tx, rx) = mpsc::channel();
@@ -1479,15 +1491,6 @@ impl App {
             self.wanted_time = None;
         } else {
             self.wanted_time = Some(self.playhead);
-        }
-    }
-
-    fn apply_source_bitrates(&mut self, info: &MediaInfo) {
-        if self.audio_bitrate_edited {
-            return;
-        }
-        if let Some(bits) = info.audio_bitrate {
-            self.audio_bitrate = format_kbps(bits);
         }
     }
 
@@ -1737,11 +1740,6 @@ fn ffmpeg_label(version: &str) -> String {
     format!("ffmpeg {number}")
 }
 
-fn format_kbps(bits_per_second: u64) -> String {
-    let kbps = ((bits_per_second as f64) / 1000.0).round() as u64;
-    format!("{kbps}k")
-}
-
 fn amd_button_label() -> &'static str {
     if cfg!(target_os = "macos") {
         "Apple"
@@ -1759,7 +1757,7 @@ fn hw_label(hw: HwAccel) -> &'static str {
     }
 }
 
-/// Remembers the hardware choice, a CRF for each encoder, and Fast-Copy or Re-Encode.
+/// Remembers the hardware choice, a CRF for each encoder, the export mode, and the auto rates.
 fn settings_path() -> Option<PathBuf> {
     let dir = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")
@@ -1785,6 +1783,8 @@ struct SavedSettings {
     hw: Option<HwAccel>,
     crf: [i32; 4],
     mode: EncodeMode,
+    audio: String,
+    fps: String,
 }
 
 fn hw_index(hw: HwAccel) -> usize {
@@ -1817,6 +1817,8 @@ fn parse_settings(text: &str) -> SavedSettings {
         hw: None,
         crf: [DEFAULT_CRF; 4],
         mode: EncodeMode::FastCopy,
+        audio: "auto".into(),
+        fps: "auto".into(),
     };
     for line in text.lines() {
         let Some((key, value)) = line.trim().split_once('=') else {
@@ -1830,6 +1832,18 @@ fn parse_settings(text: &str) -> SavedSettings {
         if key == "mode" {
             if let Some(mode) = parse_mode_name(value) {
                 saved.mode = mode;
+            }
+            continue;
+        }
+        if key == "audio" {
+            if !value.is_empty() {
+                saved.audio = value.to_string();
+            }
+            continue;
+        }
+        if key == "fps" {
+            if !value.is_empty() {
+                saved.fps = value.to_string();
             }
             continue;
         }
@@ -1868,14 +1882,20 @@ fn mode_name(mode: EncodeMode) -> &'static str {
     }
 }
 
-fn save_settings(hw: HwAccel, crf: [i32; 4], mode: EncodeMode) {
+fn save_settings(hw: HwAccel, crf: [i32; 4], mode: EncodeMode, audio: &str, fps: &str) {
     let Some(path) = settings_path() else {
         return;
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut text = format!("hw={}\nmode={}\n", hw_name(hw), mode_name(mode));
+    let mut text = format!(
+        "hw={}\nmode={}\naudio={}\nfps={}\n",
+        hw_name(hw),
+        mode_name(mode),
+        audio.trim(),
+        fps.trim()
+    );
     for choice in [HwAccel::Off, HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
         text.push_str(&format!("{}={}\n", crf_key(choice), crf[hw_index(choice)]));
     }
@@ -1933,6 +1953,15 @@ mod tests {
         assert_eq!(saved.hw, Some(HwAccel::Nvidia));
         assert_eq!(saved.crf, [DEFAULT_CRF; 4]);
         assert_eq!(saved.mode, EncodeMode::FastCopy);
+        assert_eq!(saved.audio, "auto");
+        assert_eq!(saved.fps, "auto");
+    }
+
+    #[test]
+    fn reads_saved_audio_and_frame_rate() {
+        let saved = parse_settings("audio=256k\nfps=60\n");
+        assert_eq!(saved.audio, "256k");
+        assert_eq!(saved.fps, "60");
     }
 
     #[test]
