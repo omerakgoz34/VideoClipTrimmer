@@ -190,18 +190,6 @@ impl App {
             || self.film.as_ref().is_some_and(Player::waiting)
     }
 
-    /// The video window draws itself. The interface only needs a slow tick
-    /// so the playhead can move, not a redraw on every screen refresh.
-    pub fn playhead_only(&self) -> bool {
-        self.playing
-            && self.film.is_some()
-            && self.grab.is_none()
-            && self.job.is_none()
-            && self.wanted_time.is_none()
-            && self.hw_detect.is_none()
-            && !self.film.as_ref().is_some_and(Player::waiting)
-    }
-
     /// Pause drawing and playback while the window is minimized or hidden.
     pub fn note_obscured(&mut self, obscured: bool) {
         if obscured == self.obscured {
@@ -352,6 +340,13 @@ impl App {
                     }
                     Err(_) => {
                         ui.colored_label(rgb(0xe0, 0x7a, 0x5f), FFMPEG_MISSING);
+                    }
+                }
+                #[cfg(debug_assertions)]
+                {
+                    let dt = ui.input(|input| input.stable_dt);
+                    if dt > 0.0 {
+                        ui.label(muted(&format!("{:.0} fps", 1.0 / dt)));
                     }
                 }
                 if !self.mpv_ok {
@@ -1054,10 +1049,10 @@ impl App {
         }
         let scale = ctx.pixels_per_point();
         film.place(
-            (rect.min.x * scale).round() as i32,
-            (rect.min.y * scale).round() as i32,
-            (rect.width() * scale).round() as i32,
-            (rect.height() * scale).round() as i32,
+            (rect.min.x * scale).floor() as i32,
+            (rect.min.y * scale).floor() as i32,
+            even_px(rect.width() * scale),
+            even_px(rect.height() * scale),
         );
     }
 
@@ -1796,6 +1791,11 @@ fn timeline(
         return Some(fraction as f64 * duration);
     }
     None
+}
+
+fn even_px(value: f32) -> i32 {
+    let px = value.floor() as i32;
+    (px - px % 2).max(2)
 }
 
 fn fit_rect(bounds: egui::Rect, image_w: f32, image_h: f32) -> egui::Rect {

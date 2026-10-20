@@ -164,6 +164,8 @@ impl Player {
         let _ = self.option("video-sync", "audio");
         let _ = self.option("framedrop", "vo");
         let _ = self.option("d3d11-sync-interval", "1");
+        // Flip mode leaves a green line along the bottom of an embedded window.
+        let _ = self.option("d3d11-flip", "no");
         let _ = self.option("video-latency-hacks", "yes");
         // mpv draws with its own Direct3D device. It must not use this
         // window's OpenGL context, or the whole interface breaks.
