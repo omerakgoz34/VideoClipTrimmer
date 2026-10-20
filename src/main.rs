@@ -77,6 +77,11 @@ impl mq::EventHandler for Stage {
     fn update(&mut self) {}
 
     fn draw(&mut self) {
+        let obscured = window_is_obscured();
+        self.app.note_obscured(obscured);
+        if obscured {
+            return;
+        }
         // If the driver presents early, don't run past this monitor's refresh.
         pace_to_display();
         drop_files::install();
@@ -105,6 +110,14 @@ impl mq::EventHandler for Stage {
     }
 
     fn resize_event(&mut self, _width: f32, _height: f32) {
+        mq::window::schedule_update();
+    }
+
+    fn window_minimized_event(&mut self) {
+        mq::window::schedule_update();
+    }
+
+    fn window_restored_event(&mut self) {
         mq::window::schedule_update();
     }
 
@@ -149,6 +162,57 @@ impl mq::EventHandler for Stage {
             self.app.open_paths(paths);
         }
         mq::window::schedule_update();
+    }
+}
+
+/// True when this window is minimized, cloaked, or otherwise not on screen.
+fn window_is_obscured() -> bool {
+    #[cfg(windows)]
+    {
+        win_window_is_obscured()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
+fn win_window_is_obscured() -> bool {
+    use std::ffi::c_void;
+
+    type HWND = *mut c_void;
+    const DWMWA_CLOAKED: u32 = 14;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> HWND;
+        fn IsIconic(hwnd: HWND) -> i32;
+        fn IsWindowVisible(hwnd: HWND) -> i32;
+    }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetWindowAttribute(hwnd: HWND, attr: u32, value: *mut u32, size: u32) -> i32;
+    }
+
+    unsafe {
+        let class: Vec<u16> = "MINIQUADAPP".encode_utf16().chain(Some(0)).collect();
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if hwnd.is_null() {
+            return false;
+        }
+        if IsIconic(hwnd) != 0 || IsWindowVisible(hwnd) == 0 {
+            return true;
+        }
+        let mut cloaked = 0u32;
+        let ok = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked,
+            std::mem::size_of::<u32>() as u32,
+        );
+        ok == 0 && cloaked != 0
     }
 }
 

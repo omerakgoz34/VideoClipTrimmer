@@ -30,6 +30,10 @@ pub struct App {
     in_edit: bool,
     out_edit: bool,
     playing: bool,
+    /// Playback was running when the window was minimized. Resume on restore.
+    resume_when_shown: bool,
+    /// The window is minimized or hidden. The UI does not draw in this state.
+    obscured: bool,
     loop_range: bool,
     clips: Vec<Clip>,
     selected: Option<usize>,
@@ -132,6 +136,8 @@ impl App {
             in_edit: false,
             out_edit: false,
             playing: false,
+            resume_when_shown: false,
+            obscured: false,
             loop_range: false,
             clips: Vec::new(),
             selected: None,
@@ -169,12 +175,43 @@ impl App {
     }
 
     pub fn wants_redraw(&self) -> bool {
+        if self.obscured {
+            return false;
+        }
         self.playing
             || self.grab.is_some()
             || self.job.is_some()
             || self.wanted_time.is_some()
             || self.hw_detect.is_some()
             || self.film.as_ref().is_some_and(Player::waiting)
+    }
+
+    /// Pause drawing and playback while the window is minimized or hidden.
+    pub fn note_obscured(&mut self, obscured: bool) {
+        if obscured == self.obscured {
+            return;
+        }
+        self.obscured = obscured;
+        if obscured {
+            self.resume_when_shown = self.playing;
+            if self.playing {
+                self.playing = false;
+                self.pause_players();
+            }
+            return;
+        }
+        if self.resume_when_shown {
+            self.resume_when_shown = false;
+            self.toggle_play();
+        }
+    }
+
+    fn pause_players(&mut self) {
+        if let Some(film) = &mut self.film {
+            film.set_paused(true);
+        } else if let Some(play) = &self.play {
+            play.set_paused(true);
+        }
     }
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>) {
@@ -1503,11 +1540,7 @@ impl App {
         }
         if self.playing {
             self.playing = false;
-            if let Some(film) = &mut self.film {
-                film.set_paused(true);
-            } else if let Some(play) = &self.play {
-                play.set_paused(true);
-            }
+            self.pause_players();
             return;
         }
         if self.playhead >= self.out_point - 0.05 {

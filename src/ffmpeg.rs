@@ -577,16 +577,17 @@ fn play_decode(
     }
 }
 
-/// Longest side of a preview frame. Full-resolution decode is what makes CPU playback heavy.
+/// Preview frames fit in 720p (1280×720). Smaller videos stay at their own size.
 pub fn preview_size(width: u32, height: u32) -> (u32, u32) {
-    const MAX: u32 = 960;
+    const MAX_W: u32 = 1280;
+    const MAX_H: u32 = 720;
     if width < 2 || height < 2 {
         return (640, 360);
     }
-    let (w, h) = if width <= MAX && height <= MAX {
+    let scale = (MAX_W as f64 / width as f64).min(MAX_H as f64 / height as f64);
+    let (w, h) = if scale >= 1.0 {
         (width, height)
     } else {
-        let scale = (MAX as f64 / width as f64).min(MAX as f64 / height as f64);
         (
             (width as f64 * scale).round() as u32,
             (height as f64 * scale).round() as u32,
@@ -2684,7 +2685,9 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
                 .windows(2)
                 .any(|pair| pair == ["-hwaccel_device", "hw"])
         );
-        assert_eq!(preview_size(1920, 1080), (960, 540));
+        assert_eq!(preview_size(1920, 1080), (1280, 720));
+        assert_eq!(preview_size(3840, 2160), (1280, 720));
+        assert_eq!(preview_size(1080, 1920), (404, 720));
         assert_eq!(preview_size(160, 120), (160, 120));
         assert_eq!(videotoolbox_quality(0), 100);
         assert_eq!(videotoolbox_quality(18), 64);
