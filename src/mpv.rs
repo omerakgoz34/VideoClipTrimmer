@@ -156,6 +156,15 @@ impl Player {
             let _ = self.option("linear-downscaling", "no");
             let _ = self.option("sigmoid-upscaling", "no");
         }
+        // Keep the preview cheap. One blit-style frame per video frame, synced
+        // to audio, instead of extra shader passes or uncapped presents.
+        let _ = self.option("gpu-dumb-mode", "yes");
+        let _ = self.option("deband", "no");
+        let _ = self.option("interpolation", "no");
+        let _ = self.option("video-sync", "audio");
+        let _ = self.option("framedrop", "vo");
+        let _ = self.option("d3d11-sync-interval", "1");
+        let _ = self.option("video-latency-hacks", "yes");
         // mpv draws with its own Direct3D device. It must not use this
         // window's OpenGL context, or the whole interface breaks.
         self.option("vo", "gpu")?;
@@ -173,8 +182,12 @@ impl Player {
         self.option("hr-seek", "yes")?;
         self.option("terminal", "no")?;
         self.option("keepaspect", "yes")?;
-        let hwdec = if self.hw { "auto-safe" } else { "no" };
+        let hwdec = if self.hw { "auto" } else { "no" };
         self.option("hwdec", hwdec)?;
+        if self.hw {
+            // Use the decoder texture directly instead of copying every frame.
+            let _ = self.option("d3d11va-zero-copy", "yes");
+        }
         let rc = unsafe { (self.api.initialize)(self.handle) };
         if rc < 0 {
             return Err(self.explain(rc));

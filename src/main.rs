@@ -14,6 +14,9 @@ mod timeutil;
 mod ui;
 mod video_view;
 
+use std::thread;
+use std::time::Duration;
+
 use miniquad as mq;
 
 /// From the `version` field in Cargo.toml, set when the app is built.
@@ -105,6 +108,10 @@ impl mq::EventHandler for Stage {
         egui_mq.draw(&mut **mq_ctx);
         mq_ctx.commit_frame();
 
+        if app.playhead_only() {
+            // ~20 Hz is enough for the timeline cursor. mpv keeps its own clock.
+            thread::sleep(Duration::from_millis(50));
+        }
         if app.wants_redraw() {
             mq::window::schedule_update();
         }

@@ -190,6 +190,18 @@ impl App {
             || self.film.as_ref().is_some_and(Player::waiting)
     }
 
+    /// The video window draws itself. The interface only needs a slow tick
+    /// so the playhead can move, not a redraw on every screen refresh.
+    pub fn playhead_only(&self) -> bool {
+        self.playing
+            && self.film.is_some()
+            && self.grab.is_none()
+            && self.job.is_none()
+            && self.wanted_time.is_none()
+            && self.hw_detect.is_none()
+            && !self.film.as_ref().is_some_and(Player::waiting)
+    }
+
     /// Pause drawing and playback while the window is minimized or hidden.
     pub fn note_obscured(&mut self, obscured: bool) {
         if obscured == self.obscured {
