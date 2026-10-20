@@ -413,7 +413,7 @@ impl App {
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Reading a frame…",
+                        "Loading video…",
                         egui::TextStyle::Body.resolve(ui.style()),
                         ui.visuals().text_color(),
                     );
