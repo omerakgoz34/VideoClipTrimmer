@@ -577,23 +577,9 @@ fn play_decode(
     }
 }
 
-/// Preview frames fit in 720p (1280×720). Smaller videos stay at their own size.
+/// Playback size. The picture is the source frame, not a scaled proxy.
 pub fn preview_size(width: u32, height: u32) -> (u32, u32) {
-    const MAX_W: u32 = 1280;
-    const MAX_H: u32 = 720;
-    if width < 2 || height < 2 {
-        return (640, 360);
-    }
-    let scale = (MAX_W as f64 / width as f64).min(MAX_H as f64 / height as f64);
-    let (w, h) = if scale >= 1.0 {
-        (width, height)
-    } else {
-        (
-            (width as f64 * scale).round() as u32,
-            (height as f64 * scale).round() as u32,
-        )
-    };
-    (even_dim(w.max(2)), even_dim(h.max(2)))
+    (width.max(2), height.max(2))
 }
 
 pub fn export(
@@ -2685,9 +2671,8 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'src.mp4':
                 .windows(2)
                 .any(|pair| pair == ["-hwaccel_device", "hw"])
         );
-        assert_eq!(preview_size(1920, 1080), (1280, 720));
-        assert_eq!(preview_size(3840, 2160), (1280, 720));
-        assert_eq!(preview_size(1080, 1920), (404, 720));
+        assert_eq!(preview_size(1920, 1080), (1920, 1080));
+        assert_eq!(preview_size(3840, 2160), (3840, 2160));
         assert_eq!(preview_size(160, 120), (160, 120));
         assert_eq!(videotoolbox_quality(0), 100);
         assert_eq!(videotoolbox_quality(18), 64);

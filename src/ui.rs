@@ -11,7 +11,7 @@ use crate::ffmpeg::{
     PlayRequest, PlaySession, Segment, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab,
     spawn_hw_detect, spawn_play,
 };
-use crate::mpv::Player;
+use crate::mpv::{Player, Shot};
 use crate::timeutil::{format_time, parse_time};
 
 const MIN_RANGE: f64 = 0.05;
@@ -57,7 +57,7 @@ pub struct App {
     notice: Notice,
     log: String,
     clear_armed: bool,
-    preview: Option<egui::TextureHandle>,
+    preview: Option<Picture>,
     shown_time: Option<f64>,
     wanted_time: Option<f64>,
     grab: Option<Receiver<Grabbed>>,
@@ -423,19 +423,27 @@ impl App {
                     self.empty_state(ui);
                     return;
                 }
-                let clicked = if let Some(tex) = &self.preview {
-                    paint_fitted(ui, tex).clicked()
-                } else {
-                    let available = ui.available_size();
-                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Loading video…",
-                        egui::TextStyle::Body.resolve(ui.style()),
-                        ui.visuals().text_color(),
-                    );
-                    response.clicked()
+                let clicked = match &self.preview {
+                    Some(Picture::Uploaded(tex)) => {
+                        paint_fitted(ui, tex.id(), tex.size_vec2()).clicked()
+                    }
+                    Some(Picture::Gpu { id, width, height }) => {
+                        paint_fitted(ui, egui::TextureId::User(*id), egui::vec2(*width, *height))
+                            .clicked()
+                    }
+                    None => {
+                        let available = ui.available_size();
+                        let (rect, response) =
+                            ui.allocate_exact_size(available, egui::Sense::click());
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Loading video…",
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            ui.visuals().text_color(),
+                        );
+                        response.clicked()
+                    }
                 };
                 if clicked {
                     self.toggle_play();
@@ -973,22 +981,31 @@ impl App {
     }
 
     fn pump_film(&mut self, ctx: &egui::Context) {
-        let (frame, time) = {
+        let (shot, time) = {
             let Some(film) = self.film.as_mut() else {
                 return;
             };
             film.poll()
         };
-        let showed = frame.is_some();
+        let showed = shot.is_some();
         let clock = time;
-        if let Some(pixels) = frame {
-            let (width, height) = self
-                .film
-                .as_ref()
-                .map(|film| (film.width(), film.height()))
-                .unwrap_or((0, 0));
-            if width > 0 && height > 0 {
-                self.present_frame(ctx, &pixels, width, height, clock.unwrap_or(self.playhead));
+        if let Some(shot) = shot {
+            match shot {
+                Shot::Gpu { id, width, height } => {
+                    self.preview = Some(Picture::Gpu {
+                        id: u64::from(id),
+                        width: width as f32,
+                        height: height as f32,
+                    });
+                    self.shown_time = Some(clock.unwrap_or(self.playhead));
+                }
+                Shot::Cpu {
+                    pixels,
+                    width,
+                    height,
+                } => {
+                    self.present_frame(ctx, &pixels, width, height, clock.unwrap_or(self.playhead));
+                }
             }
         }
         let Some(time) = clock else {
@@ -1037,6 +1054,7 @@ impl App {
         let hw = self.hw != HwAccel::Off;
         let playhead = self.playhead;
         self.film = None;
+        self.preview = None;
         self.play = None;
         match Player::open(&path, width, height, hw) {
             Ok(mut player) => {
@@ -1239,10 +1257,12 @@ impl App {
         let image =
             egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels);
         let options = egui::TextureOptions::LINEAR;
-        if let Some(tex) = &mut self.preview {
+        if let Some(Picture::Uploaded(tex)) = &mut self.preview {
             tex.set(image, options);
         } else {
-            self.preview = Some(ctx.load_texture("preview", image, options));
+            self.preview = Some(Picture::Uploaded(
+                ctx.load_texture("preview", image, options),
+            ));
         }
         self.shown_time = Some(time);
     }
@@ -1754,10 +1774,14 @@ fn timeline(
     None
 }
 
-fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response {
+enum Picture {
+    Uploaded(egui::TextureHandle),
+    Gpu { id: u64, width: f32, height: f32 },
+}
+
+fn paint_fitted(ui: &mut egui::Ui, tex: egui::TextureId, image: egui::Vec2) -> egui::Response {
     let available = ui.available_size();
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
-    let image = tex.size_vec2();
     if image.x < 1.0 || image.y < 1.0 || rect.width() < 1.0 || rect.height() < 1.0 {
         return response;
     }
@@ -1766,7 +1790,7 @@ fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response 
     let image_rect = egui::Rect::from_center_size(rect.center(), size);
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     ui.painter()
-        .image(tex.id(), image_rect, uv, egui::Color32::WHITE);
+        .image(tex, image_rect, uv, egui::Color32::WHITE);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
