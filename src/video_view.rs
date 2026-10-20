@@ -92,7 +92,9 @@ mod win {
     const SWP_SHOWWINDOW: u32 = 0x0040;
 
     static CLASS_READY: AtomicBool = AtomicBool::new(false);
+    /// mpv's window procedure. The click hook calls this. It must not be the hook itself.
     static PREV_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+    static PROC_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const GWLP_WNDPROC: i32 = -4;
 
     #[link(name = "user32")]
@@ -201,8 +203,10 @@ mod win {
 
     pub fn hook_clicks(hwnd: HWND) {
         unsafe {
-            let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wnd_proc as *const () as isize);
-            if prev != 0 {
+            let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, click_proc as *const () as isize);
+            // mpv already calls the class procedure. Pointing this at the hook
+            // would call the hook again and overflow the stack.
+            if prev != 0 && prev != click_proc as *const () as isize {
                 PREV_PROC.store(prev, Ordering::Relaxed);
             }
         }
@@ -227,7 +231,7 @@ mod win {
             let cursor = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
             let class = WndClass {
                 style: 0,
-                wnd_proc,
+                wnd_proc: class_proc,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: GetModuleHandleW(std::ptr::null()),
@@ -245,24 +249,41 @@ mod win {
         Ok(())
     }
 
-    unsafe extern "system" fn wnd_proc(
+    unsafe extern "system" fn class_proc(
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    unsafe extern "system" fn click_proc(
         hwnd: HWND,
         msg: UINT,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
         unsafe {
+            if PROC_DEPTH.fetch_add(1, Ordering::Relaxed) > 4 {
+                PROC_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             if msg == WM_LBUTTONUP {
                 super::CLICKED.store(true, Ordering::Relaxed);
             }
-            if msg == WM_MOUSEACTIVATE {
-                return MA_NOACTIVATE;
-            }
-            let prev = PREV_PROC.load(Ordering::Relaxed);
-            if prev != 0 {
-                return CallWindowProcW(prev, hwnd, msg, wparam, lparam);
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            let result = if msg == WM_MOUSEACTIVATE {
+                MA_NOACTIVATE
+            } else {
+                let prev = PREV_PROC.load(Ordering::Relaxed);
+                if prev != 0 {
+                    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            };
+            PROC_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            result
         }
     }
 
