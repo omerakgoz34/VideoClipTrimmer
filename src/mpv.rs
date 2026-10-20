@@ -186,10 +186,8 @@ impl Player {
         self.option("keepaspect", "yes")?;
         let hwdec = if self.hw { "auto" } else { "no" };
         self.option("hwdec", hwdec)?;
-        if self.hw {
-            // Use the decoder texture directly instead of copying every frame.
-            let _ = self.option("d3d11va-zero-copy", "yes");
-        }
+        // Zero-copy leaves a green line on the bottom and right edges.
+        let _ = self.option("d3d11va-zero-copy", "no");
         let rc = unsafe { (self.api.initialize)(self.handle) };
         if rc < 0 {
             return Err(self.explain(rc));
