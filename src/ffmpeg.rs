@@ -1604,21 +1604,16 @@ pub fn parse_hw_name(text: &str) -> Option<HwAccel> {
     }
 }
 
-/// First hardware pair that can both encode and decode here.
-/// Tries NVIDIA, then AMD, then Intel. `Off` when none of them work.
-pub fn detect_hw() -> HwAccel {
-    for hw in [HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
-        if hw_pair_works(hw) {
-            return hw;
-        }
-    }
-    HwAccel::Off
-}
-
-pub fn spawn_hw_detect() -> mpsc::Receiver<HwAccel> {
+/// Whether NVIDIA, AMD, and Intel each work on this machine, in that order.
+pub fn spawn_hw_detect() -> mpsc::Receiver<[bool; 3]> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(detect_hw());
+        let found = [
+            hw_pair_works(HwAccel::Nvidia),
+            hw_pair_works(HwAccel::Amd),
+            hw_pair_works(HwAccel::Intel),
+        ];
+        let _ = tx.send(found);
     });
     rx
 }

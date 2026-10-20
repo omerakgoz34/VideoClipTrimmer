@@ -42,7 +42,9 @@ pub struct App {
     fps: String,
     hw: HwAccel,
     hw_touched: bool,
-    hw_detect: Option<Receiver<HwAccel>>,
+    hw_detect: Option<Receiver<[bool; 3]>>,
+    /// NVIDIA, AMD, Intel. Empty until the check finishes.
+    hw_ok: [Option<bool>; 3],
     hw_warned: bool,
     /// True after this playback session gave up on the hardware decoder.
     play_using_cpu: bool,
@@ -108,9 +110,10 @@ impl App {
         let mpv_ok = crate::mpv::library_present();
         let saved = load_settings();
         let hw = saved.hw.unwrap_or(HwAccel::Off);
-        // A saved choice means this is not the first launch. Don't probe again.
+        // A saved choice means this is not the first launch. Don't change it,
+        // but still check which encoders exist so a bad choice can be flagged.
         let hw_touched = saved.hw.is_some();
-        let hw_detect = if !hw_touched && ffmpeg.is_ok() {
+        let hw_detect = if ffmpeg.is_ok() {
             Some(spawn_hw_detect())
         } else {
             None
@@ -139,6 +142,7 @@ impl App {
             hw,
             hw_touched,
             hw_detect,
+            hw_ok: [None, None, None],
             hw_warned: false,
             play_using_cpu: false,
             path_text: String::new(),
@@ -274,6 +278,7 @@ impl App {
             egui::TextStyle::Heading,
             egui::FontId::new(20.0, egui::FontFamily::Proportional),
         );
+        style.interaction.selectable_labels = false;
         ctx.set_style(style);
 
         let mut visuals = egui::Visuals::dark();
@@ -691,6 +696,10 @@ impl App {
                     ui.label(muted("checking…"));
                 }
             });
+            if let Some(text) = self.unsupported_hw_text() {
+                ui.add_space(4.0);
+                ui.colored_label(rgb(0xe0, 0x7a, 0x5f), text);
+            }
             if self.hw != previous {
                 self.apply_hw(previous);
             }
@@ -729,16 +738,21 @@ impl App {
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            let unsupported = self.unsupported_hw_text();
+            if let Some(text) = &unsupported {
+                ui.colored_label(rgb(0xe0, 0x7a, 0x5f), text);
+            }
             match &self.notice {
-                Notice::None => {
+                Notice::None if unsupported.is_none() => {
                     ui.label(muted("Ready."));
                 }
-                Notice::Info(text) => {
+                Notice::Info(text) if unsupported.is_none() => {
                     ui.label(text);
                 }
                 Notice::Error(text) => {
                     ui.colored_label(rgb(0xe0, 0x7a, 0x5f), text);
                 }
+                _ => {}
             }
             if let Some(job) = &self.job {
                 let progress = job.progress;
@@ -1541,11 +1555,18 @@ impl App {
             rx.try_recv()
         };
         match message {
-            Ok(hw) => {
+            Ok(found) => {
                 self.hw_detect = None;
+                self.hw_ok = found.map(Some);
                 if self.hw_touched {
                     return;
                 }
+                let hw = [HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel]
+                    .into_iter()
+                    .find(|hw| {
+                        hw_support_index(*hw).is_some_and(|index| self.hw_ok[index] == Some(true))
+                    })
+                    .unwrap_or(HwAccel::Off);
                 self.crf[hw_index(self.hw)] = self.video_crf.clamp(0, 51);
                 self.hw = hw;
                 self.video_crf = self.crf[hw_index(hw)];
@@ -1568,6 +1589,17 @@ impl App {
                 }
             }
         }
+    }
+
+    fn unsupported_hw_text(&self) -> Option<String> {
+        let index = hw_support_index(self.hw)?;
+        if self.hw_ok[index]? {
+            return None;
+        }
+        Some(format!(
+            "{} hardware is not supported on this machine.",
+            hw_label(self.hw)
+        ))
     }
 
     fn duration(&self) -> f64 {
@@ -1652,7 +1684,7 @@ fn timeline(
 ) -> Option<f64> {
     let width = ui.available_width();
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click_and_drag());
     let painter = ui.painter();
     painter.rect_filled(rect, 5.0, rgb(0x10, 0x11, 0x14));
     if duration > 0.0 {
@@ -1833,6 +1865,15 @@ fn hw_index(hw: HwAccel) -> usize {
         HwAccel::Nvidia => 1,
         HwAccel::Amd => 2,
         HwAccel::Intel => 3,
+    }
+}
+
+fn hw_support_index(hw: HwAccel) -> Option<usize> {
+    match hw {
+        HwAccel::Off => None,
+        HwAccel::Nvidia => Some(0),
+        HwAccel::Amd => Some(1),
+        HwAccel::Intel => Some(2),
     }
 }
 
