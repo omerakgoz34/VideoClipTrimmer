@@ -20,7 +20,11 @@ pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 fn main() {
     let platform = mq::conf::Platform {
-        blocking_event_loop: false,
+        // Wait for the monitor this window is on. One present per refresh.
+        swap_interval: Some(1),
+        // macOS paces frames with a display link, and only while this is false.
+        // Other systems block until the next draw, then the swap waits for vsync.
+        blocking_event_loop: !cfg!(target_os = "macos"),
         linux_wm_class: "videocliptrimmer",
         ..Default::default()
     };
@@ -73,6 +77,8 @@ impl mq::EventHandler for Stage {
     fn update(&mut self) {}
 
     fn draw(&mut self) {
+        // If the driver presents early, don't run past this monitor's refresh.
+        pace_to_display();
         drop_files::install();
         let dropped = drop_files::take();
         if !dropped.is_empty() {
@@ -94,12 +100,12 @@ impl mq::EventHandler for Stage {
         mq_ctx.commit_frame();
 
         if app.wants_redraw() {
-            let wait = app.redraw_wait();
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
             mq::window::schedule_update();
         }
+    }
+
+    fn resize_event(&mut self, _width: f32, _height: f32) {
+        mq::window::schedule_update();
     }
 
     fn mouse_motion_event(&mut self, x: f32, y: f32) {
@@ -143,6 +149,139 @@ impl mq::EventHandler for Stage {
             self.app.open_paths(paths);
         }
         mq::window::schedule_update();
+    }
+}
+
+/// Holds the next frame back when it would be faster than the monitor.
+/// Vsync already waits; this only fills the gap if the present returned early.
+fn pace_to_display() {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(previous) = *last else {
+        *last = Some(now);
+        return;
+    };
+    let Some(hz) = display_hz() else {
+        *last = Some(now);
+        return;
+    };
+    let frame = Duration::from_secs_f64(1.0 / hz);
+    let elapsed = now.saturating_duration_since(previous);
+    if elapsed + Duration::from_millis(2) >= frame {
+        *last = Some(now);
+        return;
+    }
+    drop(last);
+    std::thread::sleep(frame - elapsed);
+    *LAST.lock().unwrap_or_else(|err| err.into_inner()) = Some(Instant::now());
+}
+
+/// Refresh rate of the monitor the window is on, in Hz.
+/// `None` when the system does not say. Vsync still applies.
+fn display_hz() -> Option<f64> {
+    #[cfg(windows)]
+    {
+        win_display_hz()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn win_display_hz() -> Option<f64> {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static CACHED: AtomicU32 = AtomicU32::new(0);
+    static CHECKED_MS: AtomicU64 = AtomicU64::new(0);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_millis() as u64)
+        .unwrap_or(0);
+    let checked = CHECKED_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(checked) < 500 {
+        let hz = CACHED.load(Ordering::Relaxed);
+        return (hz >= 24).then_some(f64::from(hz));
+    }
+    CHECKED_MS.store(now_ms, Ordering::Relaxed);
+    let hz = query_window_hz().unwrap_or(0);
+    CACHED.store(hz, Ordering::Relaxed);
+    (hz >= 24).then_some(f64::from(hz))
+}
+
+#[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
+fn query_window_hz() -> Option<u32> {
+    use std::ffi::c_void;
+
+    type HWND = *mut c_void;
+    type HDC = *mut c_void;
+    type HMONITOR = *mut c_void;
+
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    const VREFRESH: i32 = 116;
+
+    #[repr(C)]
+    struct MonitorInfoEx {
+        size: u32,
+        monitor: [i32; 4],
+        work: [i32; 4],
+        flags: u32,
+        device: [u16; 32],
+    }
+
+    /// `DEVMODEW` is 220 bytes. The refresh rate sits at byte 184.
+    #[repr(C, align(8))]
+    struct DevMode([u8; 220]);
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> HWND;
+        fn GetDC(hwnd: HWND) -> HDC;
+        fn ReleaseDC(hwnd: HWND, dc: HDC) -> i32;
+        fn GetDeviceCaps(dc: HDC, index: i32) -> i32;
+        fn MonitorFromWindow(hwnd: HWND, flags: u32) -> HMONITOR;
+        fn GetMonitorInfoW(monitor: HMONITOR, info: *mut MonitorInfoEx) -> i32;
+        fn EnumDisplaySettingsW(device: *const u16, mode: u32, devmode: *mut DevMode) -> i32;
+    }
+
+    unsafe {
+        let class: Vec<u16> = "MINIQUADAPP".encode_utf16().chain(Some(0)).collect();
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if hwnd.is_null() {
+            return None;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if !monitor.is_null() {
+            let mut info = std::mem::zeroed::<MonitorInfoEx>();
+            info.size = std::mem::size_of::<MonitorInfoEx>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                let mut mode = std::mem::zeroed::<DevMode>();
+                mode.0[68..70].copy_from_slice(&220u16.to_ne_bytes());
+                if EnumDisplaySettingsW(info.device.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) != 0
+                {
+                    let hz = u32::from_ne_bytes(mode.0[184..188].try_into().unwrap());
+                    if (24..=500).contains(&hz) {
+                        return Some(hz);
+                    }
+                }
+            }
+        }
+        let dc = GetDC(hwnd);
+        if dc.is_null() {
+            return None;
+        }
+        let hz = GetDeviceCaps(dc, VREFRESH);
+        ReleaseDC(hwnd, dc);
+        (24..=500).contains(&hz).then_some(hz as u32)
     }
 }
 

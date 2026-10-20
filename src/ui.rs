@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
 
 use crate::ffmpeg::{
     self, EncodeMode, EncodeSettings, ExportError, Grabbed, Hooks, HwAccel, MediaInfo, PlayEvent,
@@ -176,28 +175,6 @@ impl App {
             || self.wanted_time.is_some()
             || self.hw_detect.is_some()
             || self.film.as_ref().is_some_and(Player::waiting)
-    }
-
-    /// How long to wait before the next frame. Idle windows wait on the OS instead.
-    pub fn redraw_wait(&self) -> Duration {
-        if self.playing && self.film.is_some() {
-            // mpv keeps the clock. We just sample it often enough to follow.
-            Duration::from_millis(8)
-        } else if self.playing {
-            let fps = self
-                .media
-                .as_ref()
-                .map(|media| media.info.fps)
-                .filter(|fps| fps.is_finite() && *fps > 1.0)
-                .unwrap_or(30.0)
-                .clamp(24.0, 60.0);
-            Duration::from_secs_f64(1.0 / fps)
-        } else if self.wants_redraw() {
-            // A job or a single frame is in flight. Polling faster than this just burns a core.
-            Duration::from_millis(16)
-        } else {
-            Duration::ZERO
-        }
     }
 
     pub fn open_paths(&mut self, paths: Vec<PathBuf>) {
