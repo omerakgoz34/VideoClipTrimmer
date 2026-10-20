@@ -1204,11 +1204,9 @@ fn compatible_args(
         // Quick Sync, VAAPI, and VideoToolbox never have to parse the name.
         args.extend(["-bsf:v".into(), filter]);
     }
-    // `passthrough` stops the encoder inventing a 25 fps clock. The shared
-    // timescale is what keeps a copied tail from playing in slow motion.
     args.extend([
         "-fps_mode".into(),
-        "passthrough".into(),
+        "vfr".into(),
         "-t".into(),
         format!("{:.3}", duration),
     ]);
@@ -1241,14 +1239,15 @@ fn intel_gpu_input_args() -> Vec<String> {
 }
 
 fn intel_gpu_filter(segment: &Segment, target: &Target) -> String {
-    let mut chain = String::from("hwmap=derive_device=qsv,format=qsv");
+    let mut chain = String::new();
+    if (segment.fps - target.fps).abs() > 0.01 {
+        chain.push_str(&vfr_cap(target.fps));
+        chain.push(',');
+    }
+    chain.push_str("hwmap=derive_device=qsv,format=qsv");
     let size_differs = segment.width != target.width || segment.height != target.height;
-    let fps_differs = (segment.fps - target.fps).abs() > 0.01;
-    if size_differs || fps_differs {
-        let mut vpp = format!("vpp_qsv=w={}:h={}", target.width, target.height);
-        if fps_differs {
-            vpp.push_str(&format!(":framerate={}", format_fps(target.fps)));
-        }
+    if size_differs {
+        let vpp = format!("vpp_qsv=w={}:h={}", target.width, target.height);
         chain.push(',');
         chain.push_str(&vpp);
     }
@@ -1299,7 +1298,7 @@ fn video_filter(segment: &Segment, target: &Target, hw: HwAccel) -> Option<Strin
         parts.push("setsar=1".into());
     }
     if (segment.fps - target.fps).abs() > 0.01 {
-        parts.push(format!("fps={}", format_fps(target.fps)));
+        parts.push(vfr_cap(target.fps));
     }
 
     let pix = output_pix_fmt(segment, hw);
@@ -1954,12 +1953,9 @@ fn even_dim(value: u32) -> u32 {
     }
 }
 
-fn format_fps(fps: f64) -> String {
-    if (fps - fps.round()).abs() < 0.01 {
-        format!("{}", fps.round() as i64)
-    } else {
-        format!("{fps:.3}")
-    }
+fn vfr_cap(fps: f64) -> String {
+    let interval = 1.0 / fps.max(1.0);
+    format!("select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval:.6})',setpts=PTS")
 }
 
 fn concat_line(path: &Path) -> String {

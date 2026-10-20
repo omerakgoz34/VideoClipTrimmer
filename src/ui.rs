@@ -709,7 +709,9 @@ impl App {
                     if fps.changed() {
                         self.persist();
                     }
-                    ui.label(muted("'auto' uses the source. 24, 30, 60 etc."));
+                    ui.label(muted(
+                        "'auto' keeps the source timing. A number is a variable-rate cap.",
+                    ));
                 });
             }
 
