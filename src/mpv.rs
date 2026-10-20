@@ -145,6 +145,17 @@ impl Player {
     fn configure(&mut self) -> Result<(), String> {
         let mut wid = self.view.id();
         self.set_int("wid", &mut wid)?;
+        // Preview only. The fast profile uses bilinear scaling and skips the
+        // heavy shaders. Older mpv builds may not have the profile name.
+        if self.option("profile", "fast").is_err() {
+            let _ = self.option("scale", "bilinear");
+            let _ = self.option("dscale", "bilinear");
+            let _ = self.option("cscale", "bilinear");
+            let _ = self.option("dither", "no");
+            let _ = self.option("correct-downscaling", "no");
+            let _ = self.option("linear-downscaling", "no");
+            let _ = self.option("sigmoid-upscaling", "no");
+        }
         // mpv draws with its own Direct3D device. It must not use this
         // window's OpenGL context, or the whole interface breaks.
         self.option("vo", "gpu")?;
