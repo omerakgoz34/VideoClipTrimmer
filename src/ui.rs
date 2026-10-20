@@ -521,7 +521,7 @@ impl App {
                 has_media && self.selected.is_some(),
                 Icon::Update,
                 "Update selected",
-                false,
+                true,
             )
             .clicked()
             {
