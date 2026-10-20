@@ -1,9 +1,3 @@
-//! VideoClipTrimmer — a small desktop window for cutting and joining video.
-//!
-//! The window is drawn with egui. The pixels come from miniquad (a real OS
-//! window, OpenGL, no browser). Playback is mpv when it is installed.
-//! ffmpeg does the cutting and joining.
-
 // Release builds are a GUI program. No console window, and no console output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -16,12 +10,10 @@ mod video_view;
 
 use miniquad as mq;
 
-/// From the `version` field in Cargo.toml, set when the app is built.
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 fn main() {
     let platform = mq::conf::Platform {
-        // Wait for the monitor this window is on. One present per refresh.
         swap_interval: Some(1),
         // macOS paces frames with a display link, and only while this is false.
         // Other systems block until the next draw, then the swap waits for vsync.
@@ -31,7 +23,7 @@ fn main() {
     };
 
     let conf = mq::conf::Conf {
-        window_title: format!("VideoClipTrimmer {VERSION}"),
+        window_title: "VideoClipTrimmer".to_string(),
         window_width: 1125,
         window_height: 720,
         high_dpi: true,
@@ -83,7 +75,6 @@ impl mq::EventHandler for Stage {
         if obscured {
             return;
         }
-        // If the driver presents early, don't run past this monitor's refresh.
         pace_to_display();
         drop_files::install();
         let dropped = drop_files::take();
@@ -358,7 +349,6 @@ fn app_icon() -> mq::conf::Icon {
     }
 }
 
-/// A dark tile with a steel frame and an orange cut down the middle.
 fn raster<const N: usize>(size: usize) -> [u8; N] {
     assert_eq!(N, size * size * 4);
     let mut pixels = [0u8; N];

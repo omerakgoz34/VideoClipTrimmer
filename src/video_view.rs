@@ -1,8 +1,3 @@
-//! A child window mpv draws into.
-//!
-//! mpv owns the picture. This window only reserves a rectangle in the app
-//! and reports clicks. It does not touch the app's OpenGL context.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static CLICKED: AtomicBool = AtomicBool::new(false);
@@ -53,7 +48,6 @@ impl VideoView {
         win::hide(self.hwnd);
     }
 
-    /// Take mouse clicks ahead of mpv, without stealing keyboard focus.
     pub fn hook_clicks(&self) {
         #[cfg(windows)]
         win::hook_clicks(self.hwnd);
@@ -92,7 +86,6 @@ mod win {
     const SWP_SHOWWINDOW: u32 = 0x0040;
 
     static CLASS_READY: AtomicBool = AtomicBool::new(false);
-    /// mpv's window procedure. The click hook calls this. It must not be the hook itself.
     static PREV_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
     static PROC_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const GWLP_WNDPROC: i32 = -4;

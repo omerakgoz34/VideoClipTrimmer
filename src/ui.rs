@@ -1,5 +1,3 @@
-//! The window layout. State lives on `App`; drawing happens in `App::ui`.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +31,6 @@ pub struct App {
     playing: bool,
     /// Playback was running when the window was minimized. Resume on restore.
     resume_when_shown: bool,
-    /// The window is minimized or hidden. The UI does not draw in this state.
     obscured: bool,
     loop_range: bool,
     clips: Vec<Clip>,
@@ -59,7 +56,6 @@ pub struct App {
     log: String,
     clear_armed: bool,
     preview: Option<egui::TextureHandle>,
-    /// Where the embedded mpv window should sit, in points.
     video_rect: Option<egui::Rect>,
     shown_time: Option<f64>,
     wanted_time: Option<f64>,
@@ -73,9 +69,7 @@ pub struct App {
     settings_open: bool,
     job: Option<Job>,
     themed: bool,
-    /// Shown once at startup when ffmpeg is not installed.
     warn_ffmpeg: bool,
-    /// Shown once at startup when the mpv library is not installed.
     warn_mpv: bool,
 }
 
@@ -190,7 +184,6 @@ impl App {
             || self.film.as_ref().is_some_and(Player::waiting)
     }
 
-    /// Pause drawing and playback while the window is minimized or hidden.
     pub fn note_obscured(&mut self, obscured: bool) {
         if obscured == self.obscured {
             return;
@@ -1925,7 +1918,6 @@ fn hw_label(hw: HwAccel) -> &'static str {
     }
 }
 
-/// Remembers the hardware choice, a CRF for each encoder, the export mode, the auto rates, and the last import folder.
 fn settings_path() -> Option<PathBuf> {
     let dir = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")

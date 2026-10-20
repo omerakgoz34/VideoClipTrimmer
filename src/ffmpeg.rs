@@ -1,8 +1,3 @@
-//! Every ffmpeg command lives in this file.
-//!
-//! The app shells out to the `ffmpeg` binary. It does not link libav.
-//! Change a flag here and the whole app picks it up.
-
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

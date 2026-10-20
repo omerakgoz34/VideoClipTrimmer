@@ -1,6 +1,4 @@
-//! Turn seconds into `MM:SS.mmm` text, and accept what a person might type.
-
-/// `90` → `01:30.000`. Hours show up only when the clip is at least an hour.
+/// `90` → `01:30.000`. Hours only when the clip is at least an hour.
 pub fn format_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "00:00.000".to_string();

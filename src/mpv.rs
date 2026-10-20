@@ -1,8 +1,3 @@
-//! Real playback through libmpv, loaded at run time.
-//!
-//! mpv draws the video itself, in a child of this window. The app's OpenGL
-//! context is left alone, so the interface is not flipped or overwritten.
-
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
@@ -145,8 +140,6 @@ impl Player {
     fn configure(&mut self) -> Result<(), String> {
         let mut wid = self.view.id();
         self.set_int("wid", &mut wid)?;
-        // Preview only. The fast profile uses bilinear scaling and skips the
-        // heavy shaders. Older mpv builds may not have the profile name.
         if self.option("profile", "fast").is_err() {
             let _ = self.option("scale", "bilinear");
             let _ = self.option("dscale", "bilinear");
@@ -156,8 +149,6 @@ impl Player {
             let _ = self.option("linear-downscaling", "no");
             let _ = self.option("sigmoid-upscaling", "no");
         }
-        // Keep the preview cheap. One blit-style frame per video frame, synced
-        // to audio, instead of extra shader passes or uncapped presents.
         let _ = self.option("gpu-dumb-mode", "yes");
         let _ = self.option("deband", "no");
         let _ = self.option("interpolation", "no");

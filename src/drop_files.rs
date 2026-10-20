@@ -1,8 +1,4 @@
-//! File drops.
-//!
-//! On Windows, miniquad accepts the drop but never tells the app, and it
-//! reads the whole file into memory first. A video is too big for that, so
-//! the drop dies. This module takes the path itself and leaves the file on disk.
+//! Windows drop gives miniquad the file bytes. Keep the path instead.
 
 use std::path::PathBuf;
 
