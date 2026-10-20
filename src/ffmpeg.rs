@@ -1405,8 +1405,6 @@ fn amd_encoder_args(crf: &str) -> Vec<String> {
             crf.to_string(),
             "-qp_b".into(),
             crf.to_string(),
-            "-profile:v".into(),
-            "high".into(),
         ]
     } else if cfg!(target_os = "macos") {
         // Macs have no AMF encoder. VideoToolbox is the hardware encoder there.
@@ -1466,17 +1464,14 @@ fn hw_decode_args(hw: HwAccel) -> Vec<String> {
             "-hwaccel_output_format".into(),
             "nv12".into(),
         ],
-        // D3D11VA on the AMD adapter. The AMF decoder itself fails to open.
-        // 0x1002 is AMD's vendor id, so a second GPU is not picked by mistake.
+        // D3D11VA on the AMD adapter. `vendor` is ignored; the option is vendor_id.
         HwAccel::Amd if cfg!(windows) => vec![
             "-init_hw_device".into(),
-            "d3d11va=amd,vendor=0x1002".into(),
+            "d3d11va=amd,vendor_id=0x1002,vendor=0x1002".into(),
             "-hwaccel".into(),
             "d3d11va".into(),
             "-hwaccel_device".into(),
             "amd".into(),
-            "-hwaccel_output_format".into(),
-            "nv12".into(),
         ],
         HwAccel::Amd if cfg!(target_os = "macos") => {
             vec!["-hwaccel".into(), "videotoolbox".into()]
@@ -1611,7 +1606,8 @@ fn hw_pair_works(hw: HwAccel) -> bool {
         return false;
     }
     let sample = dir.join("sample.mp4");
-    let ok = encoder_accepts(hw, &sample) && decoder_accepts(hw, &sample);
+    let encoded = encoder_accepts(hw, &sample);
+    let ok = encoded && (hw == HwAccel::Amd || decoder_accepts(hw, &sample));
     let _ = std::fs::remove_dir_all(&dir);
     ok
 }
@@ -1623,7 +1619,12 @@ fn encoder_accepts(hw: HwAccel, dest: &Path) -> bool {
     let mut cmd = ffmpeg_cmd();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     cmd.args(hw_device_init(hw));
-    cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.08"]);
+    let sample = if hw == HwAccel::Amd {
+        "color=c=black:s=256x144:r=30:d=0.1"
+    } else {
+        "color=c=black:s=64x64:r=25:d=0.08"
+    };
+    cmd.args(["-f", "lavfi", "-i", sample]);
     if let Some(filter) = upload_filter(hw) {
         cmd.args(["-vf", filter]);
     }
