@@ -12,6 +12,7 @@ mod ffmpeg;
 mod mpv;
 mod timeutil;
 mod ui;
+mod video_view;
 
 use miniquad as mq;
 

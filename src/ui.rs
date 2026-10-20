@@ -11,8 +11,9 @@ use crate::ffmpeg::{
     PlayRequest, PlaySession, Segment, check_ffmpeg, export, hw_name, parse_hw_name, spawn_grab,
     spawn_hw_detect, spawn_play,
 };
-use crate::mpv::{Player, Shot};
+use crate::mpv::Player;
 use crate::timeutil::{format_time, parse_time};
+use crate::video_view;
 
 const MIN_RANGE: f64 = 0.05;
 const VIDEO_EXT: &[&str] = &[
@@ -57,7 +58,9 @@ pub struct App {
     notice: Notice,
     log: String,
     clear_armed: bool,
-    preview: Option<Picture>,
+    preview: Option<egui::TextureHandle>,
+    /// Where the embedded mpv window should sit, in points.
+    video_rect: Option<egui::Rect>,
     shown_time: Option<f64>,
     wanted_time: Option<f64>,
     grab: Option<Receiver<Grabbed>>,
@@ -158,6 +161,7 @@ impl App {
             log: String::new(),
             clear_armed: false,
             preview: None,
+            video_rect: None,
             shown_time: None,
             wanted_time: None,
             grab: None,
@@ -270,6 +274,7 @@ impl App {
         self.settings_popup(ctx);
         self.ffmpeg_popup(ctx);
         self.mpv_popup(ctx);
+        self.place_video(ctx);
     }
 
     fn ensure_theme(&mut self, ctx: &egui::Context) {
@@ -423,29 +428,30 @@ impl App {
                     self.empty_state(ui);
                     return;
                 }
-                let clicked = match &self.preview {
-                    Some(Picture::Uploaded(tex)) => {
-                        paint_fitted(ui, tex.id(), tex.size_vec2()).clicked()
-                    }
-                    Some(Picture::Gpu { id, width, height }) => {
-                        paint_fitted(ui, egui::TextureId::User(*id), egui::vec2(*width, *height))
-                            .clicked()
-                    }
-                    None => {
-                        let available = ui.available_size();
-                        let (rect, response) =
-                            ui.allocate_exact_size(available, egui::Sense::click());
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Loading video…",
-                            egui::TextStyle::Body.resolve(ui.style()),
-                            ui.visuals().text_color(),
-                        );
-                        response.clicked()
-                    }
+                let clicked = if self.film.as_ref().is_some_and(Player::embedded) {
+                    let available = ui.available_size();
+                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                    self.video_rect = self.media.as_ref().map(|media| {
+                        fit_rect(rect, media.info.width as f32, media.info.height as f32)
+                    });
+                    response.clicked()
+                } else if let Some(tex) = &self.preview {
+                    self.video_rect = None;
+                    paint_fitted(ui, tex).clicked()
+                } else {
+                    self.video_rect = None;
+                    let available = ui.available_size();
+                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Loading video…",
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    );
+                    response.clicked()
                 };
-                if clicked {
+                if (clicked || video_view::take_click()) && self.film.is_some() {
                     self.toggle_play();
                 }
             });
@@ -980,40 +986,19 @@ impl App {
         }
     }
 
-    fn pump_film(&mut self, ctx: &egui::Context) {
-        let (shot, time) = {
+    fn pump_film(&mut self) {
+        let waiting = self.film.as_ref().is_some_and(Player::waiting);
+        let time = {
             let Some(film) = self.film.as_mut() else {
                 return;
             };
             film.poll()
         };
-        let showed = shot.is_some();
-        let clock = time;
-        if let Some(shot) = shot {
-            match shot {
-                Shot::Gpu { id, width, height } => {
-                    self.preview = Some(Picture::Gpu {
-                        id: u64::from(id),
-                        width: width as f32,
-                        height: height as f32,
-                    });
-                    self.shown_time = Some(clock.unwrap_or(self.playhead));
-                }
-                Shot::Cpu {
-                    pixels,
-                    width,
-                    height,
-                } => {
-                    self.present_frame(ctx, &pixels, width, height, clock.unwrap_or(self.playhead));
-                }
-            }
-        }
-        let Some(time) = clock else {
+        let Some(time) = time else {
             return;
         };
         if !self.playing {
-            // A seek finished on this frame. Sit the cursor on mpv's clock.
-            if showed {
+            if waiting {
                 self.playhead = self.clamp_time(time);
             }
             return;
@@ -1036,6 +1021,34 @@ impl App {
         self.playhead = self.clamp_time(time);
     }
 
+    fn place_video(&mut self, ctx: &egui::Context) {
+        let blocked = self.obscured || self.settings_open || self.warn_ffmpeg || self.warn_mpv;
+        let rect = self
+            .video_rect
+            .filter(|rect| rect.width() >= 2.0 && rect.height() >= 2.0);
+        let Some(film) = self.film.as_mut() else {
+            return;
+        };
+        if !film.embedded() {
+            return;
+        }
+        let Some(rect) = rect else {
+            film.hide();
+            return;
+        };
+        if blocked {
+            film.hide();
+            return;
+        }
+        let scale = ctx.pixels_per_point();
+        film.place(
+            (rect.min.x * scale).round() as i32,
+            (rect.min.y * scale).round() as i32,
+            (rect.width() * scale).round() as i32,
+            (rect.height() * scale).round() as i32,
+        );
+    }
+
     fn clamp_time(&self, time: f64) -> f64 {
         let duration = self.duration();
         if duration > 0.0 {
@@ -1050,13 +1063,13 @@ impl App {
             return;
         };
         let path = media.path.clone();
-        let (width, height) = ffmpeg::preview_size(media.info.width, media.info.height);
         let hw = self.hw != HwAccel::Off;
         let playhead = self.playhead;
         self.film = None;
         self.preview = None;
+        self.video_rect = None;
         self.play = None;
-        match Player::open(&path, width, height, hw) {
+        match Player::open(&path, hw) {
             Ok(mut player) => {
                 player.seek(playhead);
                 self.film = Some(player);
@@ -1082,7 +1095,7 @@ impl App {
             self.open_film();
         }
         if self.film.is_some() {
-            self.pump_film(ctx);
+            self.pump_film();
             return;
         }
         if self.playing {
@@ -1257,12 +1270,10 @@ impl App {
         let image =
             egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels);
         let options = egui::TextureOptions::LINEAR;
-        if let Some(Picture::Uploaded(tex)) = &mut self.preview {
+        if let Some(tex) = &mut self.preview {
             tex.set(image, options);
         } else {
-            self.preview = Some(Picture::Uploaded(
-                ctx.load_texture("preview", image, options),
-            ));
+            self.preview = Some(ctx.load_texture("preview", image, options));
         }
         self.shown_time = Some(time);
     }
@@ -1373,6 +1384,7 @@ impl App {
                 let duration = info.duration;
                 self.media = Some(Loaded { path, info });
                 self.preview = None;
+                self.video_rect = None;
                 self.shown_time = None;
                 if let Some((start, end)) = keep {
                     self.in_point = start;
@@ -1774,14 +1786,21 @@ fn timeline(
     None
 }
 
-enum Picture {
-    Uploaded(egui::TextureHandle),
-    Gpu { id: u64, width: f32, height: f32 },
+fn fit_rect(bounds: egui::Rect, image_w: f32, image_h: f32) -> egui::Rect {
+    if image_w < 1.0 || image_h < 1.0 || bounds.width() < 1.0 || bounds.height() < 1.0 {
+        return bounds;
+    }
+    let scale = (bounds.width() / image_w).min(bounds.height() / image_h);
+    egui::Rect::from_center_size(
+        bounds.center(),
+        egui::vec2(image_w * scale, image_h * scale),
+    )
 }
 
-fn paint_fitted(ui: &mut egui::Ui, tex: egui::TextureId, image: egui::Vec2) -> egui::Response {
+fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response {
     let available = ui.available_size();
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let image = tex.size_vec2();
     if image.x < 1.0 || image.y < 1.0 || rect.width() < 1.0 || rect.height() < 1.0 {
         return response;
     }
@@ -1790,7 +1809,7 @@ fn paint_fitted(ui: &mut egui::Ui, tex: egui::TextureId, image: egui::Vec2) -> e
     let image_rect = egui::Rect::from_center_size(rect.center(), size);
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     ui.painter()
-        .image(tex, image_rect, uv, egui::Color32::WHITE);
+        .image(tex.id(), image_rect, uv, egui::Color32::WHITE);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
