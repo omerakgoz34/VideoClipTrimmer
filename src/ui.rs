@@ -49,6 +49,8 @@ pub struct App {
     /// True after this playback session gave up on the hardware decoder.
     play_using_cpu: bool,
     path_text: String,
+    /// Folder the open dialog starts in. Kept across launches.
+    last_folder: Option<PathBuf>,
     notice: Notice,
     log: String,
     clear_armed: bool,
@@ -146,6 +148,7 @@ impl App {
             hw_warned: false,
             play_using_cpu: false,
             path_text: String::new(),
+            last_folder: saved.folder,
             notice: Notice::None,
             log: String::new(),
             clear_armed: false,
@@ -212,6 +215,7 @@ impl App {
         for path in paths {
             match ffmpeg::probe(&path) {
                 Ok(info) => {
+                    self.remember_folder(&path);
                     let index = self.clips.len();
                     self.clips.push(Clip::whole(path, info));
                     if first.is_none() {
@@ -733,7 +737,25 @@ impl App {
     }
 
     fn persist(&self) {
-        save_settings(self.hw, self.crf, self.mode, &self.audio_bitrate, &self.fps);
+        save_settings(
+            self.hw,
+            self.crf,
+            self.mode,
+            &self.audio_bitrate,
+            &self.fps,
+            self.last_folder.as_deref(),
+        );
+    }
+
+    fn remember_folder(&mut self, path: &Path) {
+        let Some(folder) = path.parent() else {
+            return;
+        };
+        if folder.as_os_str().is_empty() || self.last_folder.as_deref() == Some(folder) {
+            return;
+        }
+        self.last_folder = Some(folder.to_path_buf());
+        self.persist();
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -1270,7 +1292,8 @@ impl App {
 
     fn browse_open(&mut self) {
         self.clear_armed = false;
-        let Some(paths) = pick_videos("Open video") else {
+        let folder = self.last_folder.clone();
+        let Some(paths) = pick_videos("Open video", folder.as_deref()) else {
             return;
         };
         self.open_paths(paths);
@@ -1278,14 +1301,18 @@ impl App {
 
     fn add_videos(&mut self) {
         self.clear_armed = false;
-        let Some(paths) = pick_videos("Add videos") else {
+        let folder = self.last_folder.clone();
+        let Some(paths) = pick_videos("Add videos", folder.as_deref()) else {
             return;
         };
         let start = self.clips.len();
         let mut failed = false;
         for path in paths {
             match ffmpeg::probe(&path) {
-                Ok(info) => self.clips.push(Clip::whole(path, info)),
+                Ok(info) => {
+                    self.remember_folder(&path);
+                    self.clips.push(Clip::whole(path, info));
+                }
                 Err(err) => {
                     failed = true;
                     self.fail(err);
@@ -1308,6 +1335,7 @@ impl App {
     fn load_file(&mut self, path: PathBuf, keep: Option<(f64, f64)>) {
         match ffmpeg::probe(&path) {
             Ok(info) => {
+                self.remember_folder(&path);
                 let duration = info.duration;
                 self.media = Some(Loaded { path, info });
                 self.preview = None;
@@ -1795,12 +1823,15 @@ fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
 const FFMPEG_MISSING: &str = "No ffmpeg found on the system!";
 const MPV_MISSING: &str = "No mpv library found on the system!";
 
-fn pick_videos(title: &str) -> Option<Vec<PathBuf>> {
-    rfd::FileDialog::new()
+fn pick_videos(title: &str, folder: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let mut dialog = rfd::FileDialog::new()
         .set_title(title)
         .add_filter("Video", VIDEO_EXT)
-        .add_filter("All files", &["*"])
-        .pick_files()
+        .add_filter("All files", &["*"]);
+    if let Some(folder) = folder.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(folder);
+    }
+    dialog.pick_files()
 }
 
 fn ffmpeg_label(version: &str) -> String {
@@ -1829,7 +1860,7 @@ fn hw_label(hw: HwAccel) -> &'static str {
     }
 }
 
-/// Remembers the hardware choice, a CRF for each encoder, the export mode, and the auto rates.
+/// Remembers the hardware choice, a CRF for each encoder, the export mode, the auto rates, and the last import folder.
 fn settings_path() -> Option<PathBuf> {
     let dir = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?).join("VideoClipTrimmer")
@@ -1857,6 +1888,7 @@ struct SavedSettings {
     mode: EncodeMode,
     audio: String,
     fps: String,
+    folder: Option<PathBuf>,
 }
 
 fn hw_index(hw: HwAccel) -> usize {
@@ -1900,6 +1932,7 @@ fn parse_settings(text: &str) -> SavedSettings {
         mode: EncodeMode::FastCopy,
         audio: "auto".into(),
         fps: "auto".into(),
+        folder: None,
     };
     for line in text.lines() {
         let Some((key, value)) = line.trim().split_once('=') else {
@@ -1925,6 +1958,12 @@ fn parse_settings(text: &str) -> SavedSettings {
         if key == "fps" {
             if !value.is_empty() {
                 saved.fps = value.to_string();
+            }
+            continue;
+        }
+        if key == "folder" {
+            if !value.is_empty() {
+                saved.folder = Some(PathBuf::from(value));
             }
             continue;
         }
@@ -1963,7 +2002,14 @@ fn mode_name(mode: EncodeMode) -> &'static str {
     }
 }
 
-fn save_settings(hw: HwAccel, crf: [i32; 4], mode: EncodeMode, audio: &str, fps: &str) {
+fn save_settings(
+    hw: HwAccel,
+    crf: [i32; 4],
+    mode: EncodeMode,
+    audio: &str,
+    fps: &str,
+    folder: Option<&Path>,
+) {
     let Some(path) = settings_path() else {
         return;
     };
@@ -1979,6 +2025,12 @@ fn save_settings(hw: HwAccel, crf: [i32; 4], mode: EncodeMode, audio: &str, fps:
     );
     for choice in [HwAccel::Off, HwAccel::Nvidia, HwAccel::Amd, HwAccel::Intel] {
         text.push_str(&format!("{}={}\n", crf_key(choice), crf[hw_index(choice)]));
+    }
+    if let Some(folder) = folder.and_then(Path::to_str)
+        && !folder.is_empty()
+        && !folder.contains(['\n', '\r'])
+    {
+        text.push_str(&format!("folder={folder}\n"));
     }
     let _ = std::fs::write(path, text);
 }
@@ -2036,6 +2088,13 @@ mod tests {
         assert_eq!(saved.mode, EncodeMode::FastCopy);
         assert_eq!(saved.audio, "auto");
         assert_eq!(saved.fps, "auto");
+        assert!(saved.folder.is_none());
+    }
+
+    #[test]
+    fn reads_the_last_import_folder() {
+        let saved = parse_settings("folder=/videos/clips\n");
+        assert_eq!(saved.folder.unwrap(), PathBuf::from("/videos/clips"));
     }
 
     #[test]
