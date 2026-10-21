@@ -5,6 +5,8 @@ edition = "2024"
 description = "A simple yet useful program to trim and merge video clips."
 license = "MIT"
 
+build = "build.rs"
+
 [[bin]]
 name = "video-clip-trimmer"
 path = "src/main.rs"
@@ -16,6 +18,9 @@ miniquad = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 libloading = "0.8"
+
+[build-dependencies]
+embed-resource = "3"
 
 [profile.release]
 debug = false
