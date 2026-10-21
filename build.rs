@@ -44,7 +44,7 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "FileDescription", "{description}"
+      VALUE "FileDescription", "VideoClipTrimmer"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "video-clip-trimmer"
       VALUE "OriginalFilename", "video-clip-trimmer.exe"
