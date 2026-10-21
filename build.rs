@@ -4,14 +4,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
-    println!("cargo:rerun-if-env-changed=CARGO_PKG_DESCRIPTION");
 
     if std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("windows") {
         return;
     }
 
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
-    let description = std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_default();
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let icon = rc_path(
         &Path::new("assets/icon.ico")
@@ -19,14 +17,14 @@ fn main() {
             .expect("assets/icon.ico"),
     );
     let rc_path = Path::new(&out_dir).join("video-clip-trimmer.rc");
-    std::fs::write(&rc_path, resource_script(&version, &description, &icon)).unwrap();
+    std::fs::write(&rc_path, resource_script(&version, &icon)).unwrap();
 
     embed_resource::compile(&rc_path, embed_resource::NONE)
         .manifest_required()
         .expect("windows resource compile");
 }
 
-fn resource_script(version: &str, description: &str, icon: &str) -> String {
+fn resource_script(version: &str, icon: &str) -> String {
     let quad = version_quad(version);
     format!(
         r#"1 ICON "{icon}"
@@ -59,7 +57,6 @@ BEGIN
   END
 END
 "#,
-        description = rc_escape(description),
         icon = rc_escape(icon),
     )
 }
