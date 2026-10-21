@@ -11,7 +11,6 @@ use crate::ffmpeg::{
 };
 use crate::mpv::Player;
 use crate::timeutil::{format_time, parse_time};
-use crate::video_view;
 
 const MIN_RANGE: f64 = 0.05;
 const VIDEO_EXT: &[&str] = &[
@@ -428,20 +427,19 @@ impl App {
                     self.empty_state(ui);
                     return;
                 }
-                let clicked = if self.film.as_ref().is_some_and(Player::embedded) {
+                if self.film.as_ref().is_some_and(Player::embedded) {
                     let available = ui.available_size();
-                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
                     self.video_rect = self.media.as_ref().map(|media| {
                         fit_rect(rect, media.info.width as f32, media.info.height as f32)
                     });
-                    response.clicked()
                 } else if let Some(tex) = &self.preview {
                     self.video_rect = None;
-                    paint_fitted(ui, tex).clicked()
+                    paint_fitted(ui, tex);
                 } else {
                     self.video_rect = None;
                     let available = ui.available_size();
-                    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+                    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -449,10 +447,6 @@ impl App {
                         egui::TextStyle::Body.resolve(ui.style()),
                         ui.visuals().text_color(),
                     );
-                    response.clicked()
-                };
-                if (clicked || video_view::take_click()) && self.film.is_some() {
-                    self.toggle_play();
                 }
             });
         });
@@ -1804,12 +1798,12 @@ fn fit_rect(bounds: egui::Rect, image_w: f32, image_h: f32) -> egui::Rect {
     )
 }
 
-fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response {
+fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) {
     let available = ui.available_size();
-    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
     let image = tex.size_vec2();
     if image.x < 1.0 || image.y < 1.0 || rect.width() < 1.0 || rect.height() < 1.0 {
-        return response;
+        return;
     }
     let scale = (rect.width() / image.x).min(rect.height() / image.y);
     let size = image * scale;
@@ -1817,7 +1811,6 @@ fn paint_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Response 
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     ui.painter()
         .image(tex.id(), image_rect, uv, egui::Color32::WHITE);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[derive(Clone, Copy)]

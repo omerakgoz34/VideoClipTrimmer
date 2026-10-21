@@ -1,11 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static CLICKED: AtomicBool = AtomicBool::new(false);
-
-pub fn take_click() -> bool {
-    CLICKED.swap(false, Ordering::Relaxed)
-}
-
 pub struct VideoView {
     #[cfg(windows)]
     hwnd: *mut std::ffi::c_void,
@@ -78,7 +70,6 @@ mod win {
     const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
     const WS_CLIPCHILDREN: u32 = 0x0200_0000;
     const SW_HIDE: i32 = 0;
-    const WM_LBUTTONUP: UINT = 0x0202;
     const WM_MOUSEACTIVATE: UINT = 0x0021;
     const MA_NOACTIVATE: LRESULT = 3;
     const SWP_NOZORDER: u32 = 0x0004;
@@ -261,9 +252,6 @@ mod win {
             if PROC_DEPTH.fetch_add(1, Ordering::Relaxed) > 4 {
                 PROC_DEPTH.fetch_sub(1, Ordering::Relaxed);
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
-            }
-            if msg == WM_LBUTTONUP {
-                super::CLICKED.store(true, Ordering::Relaxed);
             }
             let result = if msg == WM_MOUSEACTIVATE {
                 MA_NOACTIVATE
